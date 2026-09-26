@@ -1641,7 +1641,8 @@ test('delete: 软删除移入 .csm-trash + 备份原文件', async () => {
 
 test('活跃防护: 30 秒内被写过的文件默认拒绝，force 可越过', async () => {
   const home = await makeHome()
-  await writeSession(home, { id: 'fresh', day: '2026-05-20' }) // mtime = now
+  const p = await writeSession(home, { id: 'fresh', day: '2026-05-20' })
+  await backdate(p, 5_000) // 5 秒前——仍在 30s 窗口内；固定偏移避免同毫秒竞态（审查修正）
   await assert.rejects(() => archiveSession({ home, id: 'fresh' }), (e) => e.code === 'active')
   const r = await archiveSession({ home, id: 'fresh', force: true })
   assert.equal(r.location, 'archived')
@@ -1683,6 +1684,12 @@ test('目的地重名: 不覆盖归档目录已有文件（前置修订 2）', a
   assert.notEqual(r.path, squatter, '重名时换用不冲突的目的名')
   assert.equal(await readFile(squatter, 'utf8'), 'PRE-EXISTING\n', '已有文件未被覆盖')
   await stat(r.path)
+})
+
+test('活跃防护: 同一毫秒写入的文件也必须拒绝（审查修正：age 负值夹紧）', async () => {
+  const home = await makeHome()
+  await writeSession(home, { id: 'now', day: '2026-05-20' }) // mtime ≈ now，可能与 Date.now() 同毫秒
+  await assert.rejects(() => archiveSession({ home, id: 'now' }), (e) => e.code === 'active')
 })
 ```
 
@@ -1741,8 +1748,10 @@ async function guardMovable(filePath, { force, expectedMtimeMs } = {}) {
   if (expectedMtimeMs !== undefined && st.mtimeMs !== expectedMtimeMs) {
     throw new CsmError('conflict', `session file changed since read (expected mtime ${expectedMtimeMs}, got ${st.mtimeMs})`)
   }
-  const age = Date.now() - st.mtimeMs
-  if (!force && age >= 0 && age < ACTIVE_WINDOW_MS) {
+  // 审查修正：APFS mtime 带小数精度而 Date.now() 截断到整毫秒，同一毫秒内写入的文件 age 为微小负值；
+  // 原 `age >= 0` 条件会放行最危险的“正在写入”场景。夹紧到 0：宁可误拒（force 可越过）不可漏放。
+  const age = Math.max(0, Date.now() - st.mtimeMs)
+  if (!force && age < ACTIVE_WINDOW_MS) {
     throw new CsmError('active', `会话 ${Math.round(age / 1000)} 秒前仍在写入，可能正被 Codex 使用；确认后可用 force=true 强制`)
   }
   return st
@@ -1809,10 +1818,12 @@ async function moveSession({ home, id, force, expectedMtimeMs, to }) {
 **Step 4: 跑测试确认通过**
 
 Run: `node --test packages/core/tests/mutate.test.js`
-Expected: PASS（8 tests）
+Expected: PASS（9 tests；连跑 5 次无不稳定——审查修正后活跃防护测试不再依赖同毫秒竞态）
 
 Run: `node --test "packages/core/tests/*.test.js"`
-Expected: PASS（34 tests：paths 6 + reader 11 + catalog 9 + mutate 8）
+Expected: PASS（35 tests：paths 6 + reader 11 + catalog 9 + mutate 9）
+
+**审查修正（2026-09-26，规格审查实证）**：原 `guardMovable` 的 `age >= 0` 条件存在同毫秒旁路——APFS mtime 带小数、`Date.now()` 截断整毫秒，刚写入的文件 age 为微小负值被直接放行（实测 190/200 新文件负 age；独立运行 mutate 测试约 4/10 概率失败，全量套件因并行负载拉长写-读间隔而掩盖）。修正：age 夹紧为 `Math.max(0, …)`（宁可误拒，force 可越过）；「活跃防护」测试改用固定 5 秒偏移去竞态；新增同毫秒回归测试（第 9 用例）。上文 Step 1/Step 3 代码块已同步修订。
 
 **Step 5: Commit**
 

@@ -45,8 +45,10 @@ async function guardMovable(filePath, { force, expectedMtimeMs } = {}) {
   if (expectedMtimeMs !== undefined && st.mtimeMs !== expectedMtimeMs) {
     throw new CsmError('conflict', `session file changed since read (expected mtime ${expectedMtimeMs}, got ${st.mtimeMs})`)
   }
-  const age = Date.now() - st.mtimeMs
-  if (!force && age >= 0 && age < ACTIVE_WINDOW_MS) {
+  // 审查修正：APFS mtime 带小数精度而 Date.now() 截断到整毫秒，同一毫秒内写入的文件 age 为微小负值；
+  // 原 `age >= 0` 条件会放行最危险的“正在写入”场景。夹紧到 0：宁可误拒（force 可越过）不可漏放。
+  const age = Math.max(0, Date.now() - st.mtimeMs)
+  if (!force && age < ACTIVE_WINDOW_MS) {
     throw new CsmError('active', `会话 ${Math.round(age / 1000)} 秒前仍在写入，可能正被 Codex 使用；确认后可用 force=true 强制`)
   }
   return st

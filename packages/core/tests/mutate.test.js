@@ -60,7 +60,8 @@ test('delete: 软删除移入 .csm-trash + 备份原文件', async () => {
 
 test('活跃防护: 30 秒内被写过的文件默认拒绝，force 可越过', async () => {
   const home = await makeHome()
-  await writeSession(home, { id: 'fresh', day: '2026-05-20' }) // mtime = now
+  const p = await writeSession(home, { id: 'fresh', day: '2026-05-20' })
+  await backdate(p, 5_000) // 5 秒前——仍在 30s 窗口内；固定偏移避免同毫秒竞态（审查修正）
   await assert.rejects(() => archiveSession({ home, id: 'fresh' }), (e) => e.code === 'active')
   const r = await archiveSession({ home, id: 'fresh', force: true })
   assert.equal(r.location, 'archived')
@@ -102,4 +103,10 @@ test('目的地重名: 不覆盖归档目录已有文件（前置修订 2）', a
   assert.notEqual(r.path, squatter, '重名时换用不冲突的目的名')
   assert.equal(await readFile(squatter, 'utf8'), 'PRE-EXISTING\n', '已有文件未被覆盖')
   await stat(r.path)
+})
+
+test('活跃防护: 同一毫秒写入的文件也必须拒绝（审查修正：age 负值夹紧）', async () => {
+  const home = await makeHome()
+  await writeSession(home, { id: 'now', day: '2026-05-20' }) // mtime ≈ now，可能与 Date.now() 同毫秒
+  await assert.rejects(() => archiveSession({ home, id: 'now' }), (e) => e.code === 'active')
 })
