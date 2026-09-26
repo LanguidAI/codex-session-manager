@@ -259,6 +259,147 @@ git add packages/core/src/errors.js packages/core/src/paths.js packages/core/tes
 git commit -m "feat(core): CODEX_HOME 解析、目录布局与路径锚定防护"
 ```
 
+### Task 2 修订（质量审查修正，后续任务以本节为准）
+
+质量审查发现 3 个 Important 问题，以 fix 提交修正：
+
+1. `anchor()` 原为纯词法包含检查，符号链接可绕过 → 增加 **realpath 归一后的包含检查**（不存在的路径按最近存在祖先归一）
+2. `anchor()` 原抛普通 `Error`（无 code，web 层会映射成 500）→ 改抛 **`CsmError('invalid')`**，消息文案与 root 解耦
+3. `codexHome()` 空字符串 override/env 会静默解析为 CWD → **空白值视为未设置**，回退 `~/.codex`
+
+配套决定（对应审查跨任务问题）：Task 10 的 `export_session.outputPath` **必须经过 `anchor`** 锚定在 CODEX_HOME 内（Task 10 文本已同步更新）。
+
+**paths.js（修订后完整实现，取代上文 Step 3 的 paths.js）：**
+
+```js
+import { realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { CsmError } from './errors.js'
+
+/** 解析 Codex 数据根目录：显式覆盖 > $CODEX_HOME > ~/.codex；空白值视为未设置。 */
+export function codexHome(override) {
+  for (const candidate of [override, process.env.CODEX_HOME]) {
+    if (typeof candidate === 'string' && candidate.trim() !== '') return resolve(candidate)
+  }
+  return resolve(join(homedir(), '.codex'))
+}
+
+/** CODEX_HOME 下的标准目录布局。 */
+export function layout(home) {
+  return {
+    home,
+    index: join(home, 'session_index.jsonl'),
+    sessionsDir: join(home, 'sessions'),
+    archivedDir: join(home, 'archived_sessions'),
+    trashDir: join(home, '.csm-trash'),
+    backupsDir: join(home, '.csm-backups'),
+  }
+}
+
+/**
+ * 把 p 解析到 root 内；逃逸时抛 CsmError('invalid')（路径穿越防护）。
+ * 双重检查：词法 relative 包含 + realpath 归一后包含（防符号链接逃逸）。
+ * 不存在的目标路径按最近存在的祖先目录归一。
+ */
+export function anchor(root, p) {
+  const resolved = isAbsolute(p) ? resolve(p) : resolve(root, p)
+  assertInside(root, resolved, p)
+  assertInside(realpathSafe(root), realpathSafe(resolved), p)
+  return resolved
+}
+
+function assertInside(root, resolved, original) {
+  const rel = relative(root, resolved)
+  if (rel !== '' && (rel === '..' || rel.startsWith('..' + sep))) {
+    throw new CsmError('invalid', `path escapes root: ${original}`)
+  }
+}
+
+/** realpath 目标路径；ENOENT/ENOTDIR 时向上回溯到最近存在的祖先后拼接剩余尾部。 */
+function realpathSafe(p) {
+  let cur = resolve(p)
+  const tail = []
+  for (;;) {
+    try {
+      const real = realpathSync(cur)
+      return tail.length === 0 ? real : join(real, ...tail.reverse())
+    } catch (e) {
+      if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw e
+      const parent = dirname(cur)
+      if (parent === cur) return cur
+      tail.push(basename(cur))
+      cur = parent
+    }
+  }
+}
+```
+
+**paths.test.js（修订后完整测试，取代上文 Step 1，共 6 个用例）：**
+
+```js
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtemp, symlink, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { anchor, codexHome, layout } from '../src/paths.js'
+
+test('codexHome: 显式覆盖 > 环境变量 > ~/.codex；空白值视为未设置', () => {
+  const saved = process.env.CODEX_HOME
+  delete process.env.CODEX_HOME
+  try {
+    assert.equal(codexHome('/x/y'), '/x/y')
+    process.env.CODEX_HOME = '/tmp/fake-codex-home'
+    assert.equal(codexHome(), '/tmp/fake-codex-home')
+    assert.equal(codexHome('   '), '/tmp/fake-codex-home', '空白 override 落到 env')
+    process.env.CODEX_HOME = ''
+    assert.equal(codexHome(), join(homedir(), '.codex'), '空白 env 落到默认')
+  } finally {
+    if (saved === undefined) delete process.env.CODEX_HOME
+    else process.env.CODEX_HOME = saved
+  }
+})
+
+test('layout: 标准目录映射（完整键集）', () => {
+  assert.deepEqual(layout('/h'), {
+    home: '/h',
+    index: '/h/session_index.jsonl',
+    sessionsDir: '/h/sessions',
+    archivedDir: '/h/archived_sessions',
+    trashDir: '/h/.csm-trash',
+    backupsDir: '/h/.csm-backups',
+  })
+})
+
+test('anchor: 根内解析放行（根自身、..foo 前缀碰撞）', () => {
+  assert.equal(anchor('/root', 'sub/a.txt'), '/root/sub/a.txt')
+  assert.equal(anchor('/root', '/root/b.txt'), '/root/b.txt')
+  assert.equal(anchor('/root', '/root'), '/root')
+  assert.equal(anchor('/root', '..foo'), '/root/..foo')
+})
+
+test('anchor: 逃逸路径抛 CsmError(invalid)', () => {
+  for (const p of ['../outside', '/etc/passwd', 'sub/../../etc']) {
+    assert.throws(() => anchor('/root', p), (e) => e.code === 'invalid' && /escapes/.test(e.message), `应拒绝: ${p}`)
+  }
+})
+
+test('anchor: 符号链接逃逸被 realpath 包含检查拦截', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'csm-anchor-'))
+  await symlink('/etc', join(root, 'link'))
+  assert.throws(() => anchor(root, 'link/passwd'), (e) => e.code === 'invalid')
+  assert.throws(() => anchor(root, 'link/nope-deep/file'), (e) => e.code === 'invalid')
+  await writeFile(join(root, 'ok.txt'), 'x')
+  assert.equal(anchor(root, 'ok.txt'), join(root, 'ok.txt'))
+})
+
+test('anchor: 根内不存在的路径放行（按最近存在祖先归一）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'csm-anchor-'))
+  assert.equal(anchor(root, 'future/dir/file.txt'), join(root, 'future/dir/file.txt'))
+})
+```
+
 ---
 
 ### Task 3: core — 测试夹具 + reader（会话解析）
@@ -1753,7 +1894,7 @@ test('rename / archive / delete 透传 core 语义', async () => {
   assert.equal((await tools.delete_session({ id: 'a' })).location, 'trash')
 })
 
-test('export_session: 默认路径在 CODEX_HOME/exports；outputPath 必须绝对', async () => {
+test('export_session: 默认 CODEX_HOME/exports；outputPath 锚定在 CODEX_HOME 内', async () => {
   const home = await makeHome()
   const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
   await backdate(p)
@@ -1762,7 +1903,9 @@ test('export_session: 默认路径在 CODEX_HOME/exports；outputPath 必须绝�
   assert.equal(r.path, join(home, 'exports', 'a.md'))
   assert.ok((await readFile(r.path, 'utf8')).includes('会话'))
   await stat(r.path)
-  await assert.rejects(() => tools.export_session({ id: 'a', outputPath: 'rel.md' }), (e) => e.code === 'invalid')
+  const r2 = await tools.export_session({ id: 'a', outputPath: 'rel.md' })
+  assert.equal(r2.path, join(home, 'rel.md'), '相对路径解析进 CODEX_HOME')
+  await assert.rejects(() => tools.export_session({ id: 'a', outputPath: '/etc/evil.md' }), (e) => e.code === 'invalid')
 })
 ```
 
@@ -1775,7 +1918,7 @@ Expected: FAIL，`Cannot find module '.../src/tools.js'`
 
 ```js
 import { mkdir, writeFile } from 'node:fs/promises'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import * as core from '@csm/core'
 
 function countBy(arr) {
@@ -1829,8 +1972,8 @@ export function createSessionTools({ home } = {}) {
     async export_session({ id, format = 'md', outputPath } = {}) {
       const s = await load(id)
       const text = core.renderExport(s, format)
-      const dest = outputPath ?? join(H, 'exports', `${id}.${format}`)
-      if (!isAbsolute(dest)) throw new core.CsmError('invalid', 'outputPath must be absolute')
+      // anchor 保证 outputPath 只能落在 CODEX_HOME 内：相对路径解析进 home，home 外绝对路径抛 invalid
+      const dest = core.anchor(H, outputPath ?? join(H, 'exports', `${id}.${format}`))
       await mkdir(dirname(dest), { recursive: true })
       await writeFile(dest, text)
       return { path: dest, bytes: Buffer.byteLength(text) }
@@ -1977,7 +2120,7 @@ description: 管理 Codex 历史会话——查询/搜索会话列表、读取�
 | rename_session | 重命名 | 参数 id+title；自动备份索引 |
 | archive_session | 归档 | 移入 archived_sessions/（官方语义，可逆） |
 | delete_session | 软删除 | 移入 .csm-trash/，**不是物理删除** |
-| export_session | 导出 | format=md/json；默认写 ~/.codex/exports/ |
+| export_session | 导出 | format=md/json；默认写 ~/.codex/exports/；outputPath 仅限 CODEX_HOME 内 |
 
 ## 使用流程
 1. 用户描述模糊时先 `list_sessions` 用关键字缩小范围，把候选（标题+时间+项目）列给用户确认。
