@@ -1,0 +1,18 @@
+{
+  "name": "session-manager",
+  "version": "0.1.0",
+  "description": "Search, read, rename, archive, soft-delete and export Codex sessions from within any conversation.",
+  "author": { "name": "LanguidAI" },
+  "license": "MIT",
+  "keywords": ["session", "history", "manager", "export", "archive"],
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Session Manager",
+    "shortDescription": "搜索与管理 Codex 历史会话",
+    "longDescription": "在对话中直接查询、读取、重命名、归档、软删除和导出 Codex 会话历史。",
+    "developerName": "LanguidAI",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"]
+  }
+}

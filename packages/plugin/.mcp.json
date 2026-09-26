@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "session_manager": {
+      "command": "node",
+      "args": ["./server.mjs"],
+      "cwd": "{{PLUGIN_REPO_DIR}}",
+      "default_tools_approval_mode": "approve",
+      "tools": {
+        "rename_session": { "approval_mode": "prompt" },
+        "archive_session": { "approval_mode": "prompt" },
+        "delete_session": { "approval_mode": "prompt" }
+      }
+    }
+  }
+}
