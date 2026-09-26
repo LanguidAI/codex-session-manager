@@ -2397,6 +2397,19 @@ git commit -m "feat(core): 统计聚合与包出口，core 完成"
 - Create: `packages/web/server.mjs`
 - Test: `packages/web/tests/api.test.js`
 
+**前置修订（2026-09-26，控制器预审——逐一核验 server 对 core 的真实签名后）：**
+
+核验结论：`readIndex(home)` 位置参数、返回 `Map<id,{title,updatedAt}>`（`.title` 存在）；`findSessionFile(home,id)`/`readSessionFile(path)`/`renderExport(session,fmt)`/`buildResumeContext(session)` 位置参数；`listSessions({home,q,cwd,model,includeArchived})`/`buildStats({home})`/`renameSession({home,id,title})`/`archiveSession({home,id,force,expectedMtimeMs})`/`deleteSession({home,id,force,expectedMtimeMs})` 对象参数——server 调用点全部匹配。发现并修正 4 处：
+
+1. **阻断性 bug（静态文件 ENOENT → 500）**：原静态处理 `const content = await readFile(p)` 未捕获 ENOENT，缺失文件落到外层 catch → `STATUS_BY_CODE['ENOENT'] ?? 500` = **500**。而穿越测试 `raw('/../../etc/passwd')` 经 fetch/URL 规范化为 `/etc/passwd`（在 PUBLIC_DIR 内、不存在）→ ENOENT → 500，但断言要求 `[403,404]` → **计划自带测试跑不过计划自带 server**。修正：静态 readFile 包 try/catch，ENOENT → 404 not_found。
+2. **缺口（expectedMtimeMs 未透传）**：`archiveSession`/`deleteSession` 的 core 签名支持 `expectedMtimeMs`（Task 5 乐观并发：mtime 与读取时不符 → conflict），但原 server 只传 `force`，导致陈旧检测在 web 层形同虚设。修正：archive/delete 端点透传 `expectedMtimeMs: body.expectedMtimeMs`（前端 Task 9 从详情 `mtimeMs` 回填）。`renameSession` 仅追加索引、无文件移动，不接受 expectedMtimeMs（设计如此）。
+3. **缺口（title 无长度上限，违 I6）**：I6 决定"core 不限长度，web/MCP 层封顶"。原 PATCH 直接把 `body.title` 交给 renameSession（core 无上限）。修正：web 层 `MAX_TITLE=200`，超长 → 400 invalid。
+4. **健壮性（malformed JSON → 500、头部注入面）**：① `readBody` 的 `JSON.parse` 失败原会落到外层 catch 成 500；改为抛 `CsmError('invalid')` → 400。② export 的 `content-disposition: filename="${id}..."` 用裸 id（理论头部注入面，尽管 id 恒为 UUID 且需先通过 loadFull）；改为 `id.replace(/[^a-zA-Z0-9._-]/g,'_')` 消毒。
+
+测试相应 +3（陈旧 expectedMtimeMs → 409 conflict 且正确值 → 200、title 超长 → 400、malformed JSON → 400），api.test.js 共 **7 tests**。
+
+5. **实施期发现的原计划 bug（已修正）**：server.mjs 块原第 2 行 import 把 `dirname` 误归到 `node:url`（`dirname` 恒为 `node:path` 导出，任何 Node 版本皆然），会在模块链接期抛 `SyntaxError: The requested module 'node:url' does not provide an export named 'dirname'`。实施 subagent 按规则 STOP（未改字节、未提交），off-repo 镜像证实仅此一行阻断、其余（4 处控制器修复 + 全部 core 调用点 + 陈旧 expectedMtimeMs 往返）均如预审工作。修正：`dirname` 移到 `node:path` 那行，`node:url` 只留 `fileURLToPath, pathToFileURL`。（控制器预审核验了 core 签名但漏了 Node 内置 import——记此为教训。）
+
 **Step 1: 写失败测试** `packages/web/tests/api.test.js`
 
 ```js
@@ -2487,6 +2500,46 @@ test('活跃会话变更返回 409 active', async () => {
     assert.equal((await res.json()).error.code, 'active')
   })
 })
+
+test('陈旧 expectedMtimeMs 返回 409 conflict，正确值放行（前置修订 2：乐观并发透传）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 's', day: '2026-05-20' })
+  await backdate(p) // 越过活跃窗口，只剩陈旧检测
+  await withServer(home, async ({ api }) => {
+    const detail = await (await api('/api/sessions/s')).json()
+    const realMtime = detail.session.mtimeMs // loadFull 透出的 mtimeMs
+    assert.equal(typeof realMtime, 'number')
+    // 错误的 expectedMtimeMs → 陈旧冲突
+    let res = await api('/api/sessions/s/archive', { method: 'POST', body: JSON.stringify({ expectedMtimeMs: realMtime + 1 }) })
+    assert.equal(res.status, 409)
+    assert.equal((await res.json()).error.code, 'conflict')
+    // 正确的 expectedMtimeMs → 放行
+    res = await api('/api/sessions/s/archive', { method: 'POST', body: JSON.stringify({ expectedMtimeMs: realMtime }) })
+    assert.equal(res.status, 200)
+  })
+})
+
+test('title 超长返回 400 invalid（前置修订 3：web 层封顶 MAX_TITLE）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 't', day: '2026-05-20' })
+  await backdate(p)
+  await withServer(home, async ({ api }) => {
+    const res = await api('/api/sessions/t', { method: 'PATCH', body: JSON.stringify({ title: 'x'.repeat(201) }) })
+    assert.equal(res.status, 400)
+    assert.equal((await res.json()).error.code, 'invalid')
+  })
+})
+
+test('malformed JSON body 返回 400 invalid 而非 500（前置修订 4）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'j', day: '2026-05-20' })
+  await backdate(p)
+  await withServer(home, async ({ api }) => {
+    const res = await api('/api/sessions/j', { method: 'PATCH', body: '{not json' })
+    assert.equal(res.status, 400)
+    assert.equal((await res.json()).error.code, 'invalid')
+  })
+})
 ```
 
 > 注意：静态页测试要求 `packages/web/public/index.html` 已存在——本 Task 先创建最小占位 `public/index.html`（内容 `<title>CSM</title>` 即可），Task 9 再写完整前端。
@@ -2502,8 +2555,8 @@ Expected: FAIL，`Cannot find module '.../server.mjs'`
 import { randomBytes } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
-import { extname, join, normalize, sep } from 'node:path'
-import { dirname, fileURLToPath, pathToFileURL } from 'node:url'
+import { dirname, extname, join, normalize, sep } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as core from '@csm/core'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -2516,6 +2569,8 @@ const MIME = {
   '.ico': 'image/x-icon',
 }
 const STATUS_BY_CODE = { not_found: 404, conflict: 409, active: 409, invalid: 400 }
+/** 标题长度上限（I6：core 不限，web/工具层封顶；超长 → 400 invalid）。 */
+const MAX_TITLE = 200
 
 function sendJson(res, status, data) {
   const body = JSON.stringify(data)
@@ -2531,7 +2586,12 @@ async function readBody(req) {
   const chunks = []
   for await (const c of req) chunks.push(c)
   if (chunks.length === 0) return {}
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    // 坏 JSON body → 400 invalid（否则 SyntaxError 无 .code，会落到外层 catch 成 500）
+    throw new core.CsmError('invalid', 'request body must be valid JSON')
+  }
 }
 
 /** 创建面板 HTTP 服务（不监听）。home 缺省用 CODEX_HOME；token 缺省随机生成。 */
@@ -2586,9 +2646,11 @@ export function createApp({ home, token } = {}) {
             if (!session) return sendError(res, 404, 'not_found', 'session not found')
             const fmt = url.searchParams.get('fmt') === 'json' ? 'json' : 'md'
             const text = core.renderExport(session, fmt)
+            // id 进响应头：去掉非 [a-zA-Z0-9._-] 字符防头部注入（正常 UUID 不受影响）
+            const safeName = id.replace(/[^a-zA-Z0-9._-]/g, '_')
             res.writeHead(200, {
               'content-type': fmt === 'json' ? 'application/json; charset=utf-8' : 'text/markdown; charset=utf-8',
-              'content-disposition': `attachment; filename="${id}.${fmt}"`,
+              'content-disposition': `attachment; filename="${safeName}.${fmt}"`,
             })
             return res.end(text)
           }
@@ -2599,13 +2661,15 @@ export function createApp({ home, token } = {}) {
           }
           const body = req.method === 'PATCH' || req.method === 'POST' ? await readBody(req) : {}
           if (req.method === 'PATCH' && !sub) {
-            return sendJson(res, 200, await core.renameSession({ home: H, id, title: body.title }))
+            const title = typeof body.title === 'string' ? body.title : ''
+            if (title.length > MAX_TITLE) return sendError(res, 400, 'invalid', `title too long (max ${MAX_TITLE} characters)`)
+            return sendJson(res, 200, await core.renameSession({ home: H, id, title }))
           }
           if (req.method === 'POST' && sub === '/archive') {
-            return sendJson(res, 200, await core.archiveSession({ home: H, id, force: body.force }))
+            return sendJson(res, 200, await core.archiveSession({ home: H, id, force: body.force, expectedMtimeMs: body.expectedMtimeMs }))
           }
           if (req.method === 'POST' && sub === '/delete') {
-            return sendJson(res, 200, await core.deleteSession({ home: H, id, force: body.force }))
+            return sendJson(res, 200, await core.deleteSession({ home: H, id, force: body.force, expectedMtimeMs: body.expectedMtimeMs }))
           }
         }
         return sendError(res, 404, 'not_found', `no route ${req.method} ${url.pathname}`)
@@ -2614,7 +2678,14 @@ export function createApp({ home, token } = {}) {
       // 静态文件（含路径穿越防护）
       const p = normalize(join(PUBLIC_DIR, url.pathname === '/' ? 'index.html' : url.pathname))
       if (p !== PUBLIC_DIR && !p.startsWith(PUBLIC_DIR + sep)) return sendError(res, 403, 'invalid', 'forbidden')
-      const content = await readFile(p)
+      let content
+      try {
+        content = await readFile(p)
+      } catch (e) {
+        // 静态文件不存在 → 404（否则 ENOENT 落到外层 catch 成 500；穿越用例期望 403/404）
+        if (e?.code === 'ENOENT') return sendError(res, 404, 'not_found', 'file not found')
+        throw e
+      }
       res.writeHead(200, { 'content-type': MIME[extname(p)] ?? 'application/octet-stream' })
       return res.end(content)
     } catch (err) {
@@ -2644,12 +2715,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 **Step 4: 跑测试确认通过**
 
 Run: `node --test packages/web/tests/api.test.js`
-Expected: PASS（4 tests）
+Expected: PASS（7 tests：health/auth、全链路、静态+穿越、活跃防护、陈旧 expectedMtimeMs、title 超长、malformed JSON）
 
 **Step 5: Commit**
 
 ```bash
-git add packages/web/server.mjs packages/web/public/index.html packages/web/tests/api.test.js
+git add packages/web/server.mjs packages/web/public/index.html packages/web/tests/api.test.js docs/plans/2026-09-26-codex-session-manager.md
 git commit -m "feat(web): REST API 服务（bearer 鉴权、错误映射、静态托管、穿越防护）"
 ```
 
