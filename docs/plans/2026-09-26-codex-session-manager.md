@@ -1030,6 +1030,8 @@ test('fastMeta: 提前 break 不泄漏 fd（stream.destroy 回收）', async () 
 
 验证：`node --test "packages/core/tests/*.test.js"` → **16/16 PASS**（paths 6 + reader 10）。
 
+**测试修订（2026-09-26，实施中发现）**：① 原排序用例依赖墙钟——b 无索引条目时 updatedAt 回退为文件 mtime（=测试运行时刻），恒排在 2026-05-21 的索引日期之前，断言永不成立；改为用 `backdate` 把 b 拨回固定过去时刻，确定性成立（原稿遗漏该行，未使用的 backdate 导入即其痕迹）。② 原 findSessionFile 用例的 trash 分支未真实覆盖（文件被移到 home 根而非 `.csm-trash/`）；改为真实移入 trashDir 并断言 location='trash'。③ 移除未使用的 `sessionRelPath` 导入。
+
 **Step 1: 写失败测试** `packages/core/tests/catalog.test.js`
 
 ```js
@@ -1039,7 +1041,7 @@ import { mkdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import { findSessionFile, listSessions, readIndex } from '../src/catalog.js'
 import { layout } from '../src/paths.js'
-import { backdate, makeHome, sessionRelPath, writeIndex, writeSession } from './helpers/fixture.js'
+import { backdate, makeHome, writeIndex, writeSession } from './helpers/fixture.js'
 
 test('readIndex: 同 id 多行取最后；文件缺失返回空 Map', async () => {
   const home = await makeHome()
@@ -1055,7 +1057,8 @@ test('readIndex: 同 id 多行取最后；文件缺失返回空 Map', async () =
 test('listSessions: 索引标题合并 + 未命名回退 + 按 updatedAt 倒序', async () => {
   const home = await makeHome()
   await writeSession(home, { id: 'a', day: '2026-05-20' })
-  await writeSession(home, { id: 'b', day: '2026-05-21', cwd: '/proj/beta' })
+  const pb = await writeSession(home, { id: 'b', day: '2026-05-21', cwd: '/proj/beta' })
+  await backdate(pb, Date.now() - Date.parse('2026-05-21T12:00:00Z')) // b 无索引条目→mtime 兜底；拨回固定过去保证确定性
   await writeIndex(home, [{ id: 'a', thread_name: '修复登录', updated_at: '2026-05-21T20:00:00Z' }])
   const list = await listSessions({ home })
   assert.equal(list.length, 2)
@@ -1091,7 +1094,7 @@ test('listSessions: 归档目录默认不含，includeArchived 含且带 archive
 test('findSessionFile: active/archived/trash 定位与 location 标记', async () => {
   const home = await makeHome()
   const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
-  let found = await findSessionFile(home, 'a')
+  const found = await findSessionFile(home, 'a')
   assert.equal(found.location, 'active')
   assert.equal(found.path, p)
   assert.ok(found.mtimeMs > 0)
@@ -1099,7 +1102,9 @@ test('findSessionFile: active/archived/trash 定位与 location 标记', async (
   await mkdir(l.archivedDir, { recursive: true })
   await rename(p, join(l.archivedDir, 'rollout-a.jsonl'))
   assert.equal((await findSessionFile(home, 'a')).location, 'archived')
-  await rename(join(l.archivedDir, 'rollout-a.jsonl'), join(home, '.csm-trash-x.jsonl')).catch(() => {})
+  await mkdir(l.trashDir, { recursive: true })
+  await rename(join(l.archivedDir, 'rollout-a.jsonl'), join(l.trashDir, 'rollout-a.jsonl'))
+  assert.equal((await findSessionFile(home, 'a')).location, 'trash', '回收站也能定位')
   assert.equal(await findSessionFile(home, 'nope'), null)
 })
 
