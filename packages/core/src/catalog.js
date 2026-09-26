@@ -118,16 +118,16 @@ export async function listSessions({ home, q, cwd, model, includeArchived = fals
 }
 
 /**
- * 按 id 定位会话文件；文件名含 id 才打开解析（性能护栏）。
- * 审查修订：同 id 多文件（resume 分片）返回该 location 内 mtime 最新者（不再依赖 readdir 顺序）；
- * location 优先级 active > archived > trash；空/非字符串 id 直接返回 null。
- * @returns {Promise<null | {path: string, location: 'active'|'archived'|'trash', mtimeMs: number, size: number}>}
+ * 按 id 找出全部文件（含 resume 分片），按 location 优先级（active > archived > trash）分组、
+ * 组内按 mtime 降序。首元素与 findSessionFile 的返回语义一致。
+ * @returns {Promise<Array<{path: string, location: 'active'|'archived'|'trash', mtimeMs: number, size: number}>>}
  */
-export async function findSessionFile(home, id) {
-  if (typeof id !== 'string' || id === '') return null
+export async function findSessionFiles(home, id) {
+  if (typeof id !== 'string' || id === '') return []
   const l = layout(home)
+  const out = []
   for (const [dir, location] of [[l.sessionsDir, 'active'], [l.archivedDir, 'archived'], [l.trashDir, 'trash']]) {
-    let best = null
+    const group = []
     for await (const p of walkJsonl(dir)) {
       if (!basename(p).includes(id)) continue
       // 单文件读取失败跳过继续找（审查修订）
@@ -135,15 +135,24 @@ export async function findSessionFile(home, id) {
         const meta = await fastMeta(p)
         if (meta.id !== id) continue
         const st = await stat(p)
-        if (!best || st.mtimeMs > best.mtimeMs) {
-          best = { path: p, location, mtimeMs: st.mtimeMs, size: st.size }
-        }
+        group.push({ path: p, location, mtimeMs: st.mtimeMs, size: st.size })
       } catch (e) {
         if (isFsError(e)) continue
         throw e
       }
     }
-    if (best) return best
+    group.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    out.push(...group)
   }
-  return null
+  return out
+}
+
+/**
+ * 按 id 定位会话文件；文件名含 id 才打开解析（性能护栏）。
+ * 同 id 多文件（resume 分片）返回优先级最高 location 中 mtime 最新者。
+ * @returns {Promise<null | {path: string, location: 'active'|'archived'|'trash', mtimeMs: number, size: number}>}
+ */
+export async function findSessionFile(home, id) {
+  const matches = await findSessionFiles(home, id)
+  return matches.length > 0 ? matches[0] : null
 }

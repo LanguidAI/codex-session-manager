@@ -1523,14 +1523,65 @@ test('updatedAt 取索引与 mtime 较新者；非字符串索引时间回退磁
 
 **Files:**
 - Create: `packages/core/src/mutate.js`
+- Modify: `packages/core/src/catalog.js`（前置修订：新增 `findSessionFiles`，见下）
 - Test: `packages/core/tests/mutate.test.js`
+
+**前置修订（2026-09-26，控制器预审，基于 Task 4 审查实证）：**
+
+1. **分片整体移动**：Task 4 审查实证 resume 分片（同 id 多文件）真实存在（语料 6 id/16 文件）。若归档/删除只移动 `findSessionFile` 返回的单个最新文件，旧分片仍留在活跃列表——用户看到"归档了却还在列表里"。修正：catalog.js 新增 `findSessionFiles(home, id)` 返回**全部**匹配文件（location 优先级 active > archived > trash 分组、组内 mtime 降序），`findSessionFile` 重构为其薄封装（取首元素，行为不变）；`archiveSession`/`deleteSession` 移动**主 location 的全部同 id 文件**（`expectedMtimeMs` 只约束主文件，其余分片只做活跃防护）。
+2. **目的地防碰撞**：`fsRename` 遇同名目标会**静默覆盖**且被覆盖方无备份（违反"绝不丢数据"设计原则）。修正：`uniqueDest()` 在目标已存在时于扩展名前插入 `-<毫秒时间戳>-<序号>`。
+3. **备份目录防同名**：备份目录名追加 4 位随机十六进制后缀，避免同一毫秒内两次变更互相覆盖备份。
+
+**catalog.js 修订（替换现有 `findSessionFile` 函数为以下两个函数，其余不动）：**
+
+```js
+/**
+ * 按 id 找出全部文件（含 resume 分片），按 location 优先级（active > archived > trash）分组、
+ * 组内按 mtime 降序。首元素与 findSessionFile 的返回语义一致。
+ * @returns {Promise<Array<{path: string, location: 'active'|'archived'|'trash', mtimeMs: number, size: number}>>}
+ */
+export async function findSessionFiles(home, id) {
+  if (typeof id !== 'string' || id === '') return []
+  const l = layout(home)
+  const out = []
+  for (const [dir, location] of [[l.sessionsDir, 'active'], [l.archivedDir, 'archived'], [l.trashDir, 'trash']]) {
+    const group = []
+    for await (const p of walkJsonl(dir)) {
+      if (!basename(p).includes(id)) continue
+      // 单文件读取失败跳过继续找（审查修订）
+      try {
+        const meta = await fastMeta(p)
+        if (meta.id !== id) continue
+        const st = await stat(p)
+        group.push({ path: p, location, mtimeMs: st.mtimeMs, size: st.size })
+      } catch (e) {
+        if (isFsError(e)) continue
+        throw e
+      }
+    }
+    group.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    out.push(...group)
+  }
+  return out
+}
+
+/**
+ * 按 id 定位会话文件；文件名含 id 才打开解析（性能护栏）。
+ * 同 id 多文件（resume 分片）返回优先级最高 location 中 mtime 最新者。
+ * @returns {Promise<null | {path: string, location: 'active'|'archived'|'trash', mtimeMs: number, size: number}>}
+ */
+export async function findSessionFile(home, id) {
+  const matches = await findSessionFiles(home, id)
+  return matches.length > 0 ? matches[0] : null
+}
+```
 
 **Step 1: 写失败测试** `packages/core/tests/mutate.test.js`
 
 ```js
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { findSessionFile, listSessions, readIndex } from '../src/catalog.js'
 import { archiveSession, deleteSession, renameSession } from '../src/mutate.js'
@@ -1605,6 +1656,34 @@ test('冲突防护: expectedMtimeMs 不符 → conflict', async () => {
     (e) => e.code === 'conflict',
   )
 })
+
+test('resume 分片: 归档一次移走全部文件，活跃列表不再出现该线程', async () => {
+  const home = await makeHome()
+  const p1 = await writeSession(home, { id: 'r1', day: '2026-05-20', fork: 'fork-a' })
+  await backdate(p1)
+  const p2 = await writeSession(home, { id: 'r1', day: '2026-05-21', fork: 'fork-b' })
+  await backdate(p2)
+  const r = await archiveSession({ home, id: 'r1' })
+  assert.equal(r.location, 'archived')
+  assert.equal((await listSessions({ home })).length, 0, '活跃列表不再有该 id（两个分片都被移走）')
+  const names = await readdir(layout(home).archivedDir)
+  assert.equal(names.length, 2, '两个分片都进了归档目录')
+  assert.equal((await findSessionFile(home, 'r1')).location, 'archived')
+})
+
+test('目的地重名: 不覆盖归档目录已有文件（前置修订 2）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await backdate(p)
+  const l = layout(home)
+  await mkdir(l.archivedDir, { recursive: true })
+  const squatter = join(l.archivedDir, 'rollout-2026-05-20T00-00-00-a.jsonl')
+  await writeFile(squatter, 'PRE-EXISTING\n')
+  const r = await archiveSession({ home, id: 'a' })
+  assert.notEqual(r.path, squatter, '重名时换用不冲突的目的名')
+  assert.equal(await readFile(squatter, 'utf8'), 'PRE-EXISTING\n', '已有文件未被覆盖')
+  await stat(r.path)
+})
 ```
 
 **Step 2: 跑测试确认失败**
@@ -1612,25 +1691,48 @@ test('冲突防护: expectedMtimeMs 不符 → conflict', async () => {
 Run: `node --test packages/core/tests/mutate.test.js`
 Expected: FAIL，`Cannot find module '.../src/mutate.js'`
 
-**Step 3: 实现** `packages/core/src/mutate.js`
+**Step 3: 实现** `packages/core/src/mutate.js`（前置修订后完整实现）
 
 ```js
+import { randomBytes } from 'node:crypto'
 import { appendFile, copyFile, mkdir, rename as fsRename, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
-import { findSessionFile } from './catalog.js'
+import { findSessionFiles } from './catalog.js'
 import { CsmError } from './errors.js'
 import { layout } from './paths.js'
 
 /** 距上次写入不足该窗口的会话视为“正在使用”，默认拒绝变更。 */
 const ACTIVE_WINDOW_MS = 30_000
 
-/** 把文件备份到 .csm-backups/<时间戳>/ 下，返回备份路径。 */
+/** 备份目录名：时间戳 + 随机后缀，避免同一毫秒内两次变更的备份互相覆盖（前置修订 3）。 */
+function backupDirName() {
+  return `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomBytes(2).toString('hex')}`
+}
+
+/** 把文件备份到 .csm-backups/<时间戳-随机>/ 下，返回备份路径。 */
 async function backupFile(home, filePath) {
-  const dir = join(layout(home).backupsDir, new Date().toISOString().replace(/[:.]/g, '-'))
+  const dir = join(layout(home).backupsDir, backupDirName())
   await mkdir(dir, { recursive: true })
   const dest = join(dir, basename(filePath))
   await copyFile(filePath, dest)
   return dest
+}
+
+/** 防碰撞目的名：目标已存在时在扩展名前插入 -<毫秒时间戳>-<序号>，绝不覆盖已有文件（前置修订 2）。 */
+async function uniqueDest(dir, filePath) {
+  const base = basename(filePath)
+  const dot = base.lastIndexOf('.')
+  const stem = dot > 0 ? base.slice(0, dot) : base
+  const ext = dot > 0 ? base.slice(dot) : ''
+  let dest = join(dir, base)
+  for (let i = 1; ; i++) {
+    try {
+      await stat(dest)
+      dest = join(dir, `${stem}-${Date.now()}-${i}${ext}`)
+    } catch {
+      return dest
+    }
+  }
 }
 
 /** 移动前防护：mtime 与读取时不符 → conflict；30s 内活跃写入 → active（force 越过）。 */
@@ -1650,8 +1752,8 @@ async function guardMovable(filePath, { force, expectedMtimeMs } = {}) {
 export async function renameSession({ home, id, title }) {
   const t = typeof title === 'string' ? title.trim() : ''
   if (!t) throw new CsmError('invalid', 'title is required')
-  const found = await findSessionFile(home, id)
-  if (!found) throw new CsmError('not_found', `session ${id} not found`)
+  const matches = await findSessionFiles(home, id)
+  if (matches.length === 0) throw new CsmError('not_found', `session ${id} not found`)
   const l = layout(home)
   try {
     await stat(l.index)
@@ -1663,45 +1765,60 @@ export async function renameSession({ home, id, title }) {
   return { id, title: t }
 }
 
-/** 归档：移入官方 archived_sessions/（与 Desktop 行为一致），先备份。 */
+/** 归档：把会话的全部分片文件移入官方 archived_sessions/（与 Desktop 行为一致），逐个先备份。 */
 export async function archiveSession({ home, id, force, expectedMtimeMs }) {
-  const l = layout(home)
-  const found = await findSessionFile(home, id)
-  if (!found) throw new CsmError('not_found', `session ${id} not found`)
-  if (found.location !== 'active') throw new CsmError('invalid', `session is already ${found.location}`)
-  await guardMovable(found.path, { force, expectedMtimeMs })
-  await backupFile(home, found.path)
-  await mkdir(l.archivedDir, { recursive: true })
-  const dest = join(l.archivedDir, basename(found.path))
-  await fsRename(found.path, dest)
-  return { id, location: 'archived', path: dest }
+  return moveSession({ home, id, force, expectedMtimeMs, to: 'archived' })
 }
 
-/** 删除：软删除，移入 .csm-trash/（绝不物理删除），先备份。 */
+/** 删除：软删除，把会话的全部分片文件移入 .csm-trash/（绝不物理删除），逐个先备份。 */
 export async function deleteSession({ home, id, force, expectedMtimeMs }) {
+  return moveSession({ home, id, force, expectedMtimeMs, to: 'trash' })
+}
+
+/**
+ * 共享移动逻辑：定位全部匹配 → location 校验 → 逐文件防护/备份/防碰撞移动。
+ * expectedMtimeMs 只约束主文件（UI/工具读到的那个），其余分片只做活跃防护（前置修订 1）。
+ */
+async function moveSession({ home, id, force, expectedMtimeMs, to }) {
   const l = layout(home)
-  const found = await findSessionFile(home, id)
-  if (!found) throw new CsmError('not_found', `session ${id} not found`)
-  if (found.location === 'trash') throw new CsmError('invalid', 'session is already in trash')
-  await guardMovable(found.path, { force, expectedMtimeMs })
-  await backupFile(home, found.path)
-  await mkdir(l.trashDir, { recursive: true })
-  const dest = join(l.trashDir, basename(found.path))
-  await fsRename(found.path, dest)
-  return { id, location: 'trash', path: dest }
+  const matches = await findSessionFiles(home, id)
+  if (matches.length === 0) throw new CsmError('not_found', `session ${id} not found`)
+  const primary = matches[0]
+  if (to === 'archived' && primary.location !== 'active') {
+    throw new CsmError('invalid', `session is already ${primary.location}`)
+  }
+  if (to === 'trash' && primary.location === 'trash') {
+    throw new CsmError('invalid', 'session is already in trash')
+  }
+  const group = matches.filter((m) => m.location === primary.location)
+  const destDir = to === 'archived' ? l.archivedDir : l.trashDir
+  await mkdir(destDir, { recursive: true })
+  let dest = null
+  for (const m of group) {
+    const isPrimary = m.path === primary.path
+    await guardMovable(m.path, { force, expectedMtimeMs: isPrimary ? expectedMtimeMs : undefined })
+    await backupFile(home, m.path)
+    const d = await uniqueDest(destDir, m.path)
+    await fsRename(m.path, d)
+    if (isPrimary) dest = d
+  }
+  return { id, location: to, path: dest }
 }
 ```
 
 **Step 4: 跑测试确认通过**
 
 Run: `node --test packages/core/tests/mutate.test.js`
-Expected: PASS（6 tests）
+Expected: PASS（8 tests）
+
+Run: `node --test "packages/core/tests/*.test.js"`
+Expected: PASS（34 tests：paths 6 + reader 11 + catalog 9 + mutate 8）
 
 **Step 5: Commit**
 
 ```bash
-git add packages/core/src/mutate.js packages/core/tests/mutate.test.js
-git commit -m "feat(core): 重命名/归档/软删除（备份 + 活跃防护 + 冲突检测）"
+git add packages/core/src/mutate.js packages/core/src/catalog.js packages/core/tests/mutate.test.js docs/plans/2026-09-26-codex-session-manager.md
+git commit -m "feat(core): 重命名/归档/软删除（备份 + 防护 + 分片整体移动 + 防碰撞目的名）"
 ```
 
 ---
