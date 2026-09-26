@@ -9,7 +9,9 @@ function countBy(arr) {
 }
 
 function clip(text, n) {
-  return text.length > n ? `${text.slice(0, n)}…（已截断）` : text
+  if (text.length <= n) return text
+  const cut = /^[\uD800-\uDBFF]$/.test(text[n - 1]) ? n - 1 : n // 不拆开代理对（审查 I2）
+  return `${text.slice(0, cut)}…（已截断）`
 }
 
 /** 会话 → Markdown 对话日志。 */
@@ -33,15 +35,28 @@ export function toMarkdown(session) {
   return [...head, ...body, ...tools].join('\n')
 }
 
-/** 会话 → 结构化 JSON。 */
+/** 导出字段白名单：只含 Session 固有字段，排除上层临时挂载的本地状态（archived/mtimeMs 等），
+ *  保证同一会话的 JSON 导出逐字节可复现（审查 I1）。保留 reader 全保真字段（含 badLines）。 */
+const EXPORT_FIELDS = [
+  'id', 'title', 'cwd', 'originator', 'cliVersion', 'provider', 'model',
+  'createdAt', 'updatedAt', 'messages', 'toolCalls', 'tokens', 'badLines',
+]
+
+/** 会话 → 结构化 JSON（字段白名单，见 EXPORT_FIELDS）。 */
 export function toJson(session) {
-  return JSON.stringify(session, null, 2)
+  return JSON.stringify(Object.fromEntries(EXPORT_FIELDS.map((k) => [k, session[k] ?? null])), null, 2)
 }
 
-/** 生成紧凑的“恢复上下文” Markdown，供粘贴到新会话继续。 */
+/**
+ * 生成紧凑的“恢复上下文” Markdown，供粘贴到新会话继续。
+ * 选项单位均为 UTF-16 code unit；预算总量 ≈ goalChars + maxMessages×maxCharsPerMessage（默认 ≈ 3.9K，语料最坏实测 ≈ 5.2KB）。
+ * @param {number} maxMessages 纳入的最近消息条数（<=0 表示只保留原目标、不带最近进展；审查 I3）
+ * @param {number} maxCharsPerMessage 每条最近消息的裁剪长度
+ * @param {number} goalChars 原目标（首条用户消息）的裁剪长度
+ */
 export function buildResumeContext(session, { maxMessages = 6, maxCharsPerMessage = 400, goalChars = 1500 } = {}) {
   const firstUser = session.messages.find((m) => m.role === 'user')
-  const recent = session.messages.slice(-maxMessages)
+  const recent = maxMessages > 0 ? session.messages.slice(-maxMessages) : []
   return [
     `# 请继续这个 Codex 会话：${session.title ?? session.id}`,
     `- 原项目目录: ${session.cwd ?? '?'}`,

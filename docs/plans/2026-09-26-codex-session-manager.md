@@ -1970,6 +1970,16 @@ function sample(overrides = {}) {
   return s
 }
 
+/** 直接构造 Session 记录（export 为纯函数，接受任何该形状的对象），用于窗口化/回退/边界测试。 */
+function synthSession(msgTexts, overrides = {}) {
+  return {
+    id: 'syn-1', title: null, cwd: '/proj/syn', originator: null, cliVersion: null,
+    provider: 'openai', model: 'gpt-x', createdAt: null, updatedAt: null,
+    messages: msgTexts.map((t, i) => ({ role: i % 2 === 0 ? 'user' : 'assistant', text: t, timestamp: null })),
+    toolCalls: [], tokens: null, badLines: 0, ...overrides,
+  }
+}
+
 test('toMarkdown: 含元信息头、用户/助手消息、工具统计', () => {
   const md = toMarkdown(sample())
   assert.ok(md.includes('# 测试会话'))
@@ -1980,11 +1990,12 @@ test('toMarkdown: 含元信息头、用户/助手消息、工具统计', () => {
   assert.ok(md.includes('exec_command'))
 })
 
-test('renderExport: json 可 round-trip；未知格式抛 invalid', () => {
+test('renderExport: json 可 round-trip；md 走 toMarkdown；未知格式抛 invalid', () => {
   const s = sample()
   const back = JSON.parse(renderExport(s, 'json'))
   assert.equal(back.id, 'sid-1')
   assert.equal(back.messages.length, s.messages.length)
+  assert.ok(renderExport(s, 'md').startsWith('# 测试会话'), 'md 分支走 toMarkdown（Task 10 export 默认格式）')
   assert.throws(() => renderExport(s, 'xml'), (e) => e.code === 'invalid')
 })
 
@@ -1995,6 +2006,48 @@ test('buildResumeContext: 含原目标 + 最近进展 + 截断', () => {
   assert.ok(text.includes('原项目目录: /proj/alpha'))
   assert.ok(text.includes('…（已截断）'))
   assert.ok(text.includes('完成A'))
+})
+
+test('buildResumeContext: 默认窗口只取最近 6 条、排除更早消息，并按默认长度裁剪（审查缺口 #2）', () => {
+  const texts = []
+  for (let i = 0; i < 10; i++) texts.push(i === 9 ? 'x'.repeat(500) : `消息${i}号`)
+  const s = synthSession(texts)
+  const text = buildResumeContext(s) // 全默认 maxMessages=6 maxCharsPerMessage=400 goalChars=1500
+  for (const i of [4, 5, 6, 7, 8]) assert.ok(text.includes(`消息${i}号`), `消息${i}号 应在最近窗口`)
+  for (const i of [1, 2, 3]) assert.ok(!text.includes(`消息${i}号`), `消息${i}号 应被窗口排除`)
+  assert.ok(text.includes('…（已截断）'), '500 字尾条应按默认 400 裁剪')
+})
+
+test('toMarkdown/buildResumeContext: title 为 null 时回退到 id（审查缺口 #3，真实语料 ~35% 无索引标题）', () => {
+  const s = synthSession(['你好']) // title: null
+  assert.ok(toMarkdown(s).startsWith('# syn-1'), 'toMarkdown 用 id 作标题')
+  assert.ok(buildResumeContext(s).includes('会话：syn-1'), 'resume 上下文用 id 作标题')
+})
+
+test('clip: 截断边界不拆开代理对（审查 I2）', () => {
+  const s = synthSession(['a😀b'], { title: 'T' })
+  const text = buildResumeContext(s, { goalChars: 2 }) // 边界正落在 '😀' 中间
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(text), '输出不应含孤立高位代理')
+  assert.ok(text.includes('…（已截断）'))
+})
+
+test('toJson: 白名单排除上层临时挂载字段（审查 I1，Task 10 持久化工件可复现）', () => {
+  const s = sample()
+  s.archived = true
+  s.mtimeMs = 123456
+  const back = JSON.parse(renderExport(s, 'json'))
+  assert.equal(back.id, 'sid-1')
+  assert.ok(Array.isArray(back.messages))
+  assert.equal('archived' in back, false, 'archived 不应进入导出工件')
+  assert.equal('mtimeMs' in back, false, 'mtimeMs 不应进入导出工件')
+  assert.equal('badLines' in back, true, 'reader 保真字段保留')
+})
+
+test('buildResumeContext: maxMessages<=0 只保留原目标、不带最近进展（审查 I3）', () => {
+  const s = synthSession(['目标消息', '进展一', '进展二'])
+  const text = buildResumeContext(s, { maxMessages: 0 })
+  assert.ok(text.includes('目标消息'), '原目标仍在')
+  assert.ok(!text.includes('进展一'), 'maxMessages=0 不带最近进展')
 })
 ```
 
@@ -2017,7 +2070,9 @@ function countBy(arr) {
 }
 
 function clip(text, n) {
-  return text.length > n ? `${text.slice(0, n)}…（已截断）` : text
+  if (text.length <= n) return text
+  const cut = /^[\uD800-\uDBFF]$/.test(text[n - 1]) ? n - 1 : n // 不拆开代理对（审查 I2）
+  return `${text.slice(0, cut)}…（已截断）`
 }
 
 /** 会话 → Markdown 对话日志。 */
@@ -2041,15 +2096,28 @@ export function toMarkdown(session) {
   return [...head, ...body, ...tools].join('\n')
 }
 
-/** 会话 → 结构化 JSON。 */
+/** 导出字段白名单：只含 Session 固有字段，排除上层临时挂载的本地状态（archived/mtimeMs 等），
+ *  保证同一会话的 JSON 导出逐字节可复现（审查 I1）。保留 reader 全保真字段（含 badLines）。 */
+const EXPORT_FIELDS = [
+  'id', 'title', 'cwd', 'originator', 'cliVersion', 'provider', 'model',
+  'createdAt', 'updatedAt', 'messages', 'toolCalls', 'tokens', 'badLines',
+]
+
+/** 会话 → 结构化 JSON（字段白名单，见 EXPORT_FIELDS）。 */
 export function toJson(session) {
-  return JSON.stringify(session, null, 2)
+  return JSON.stringify(Object.fromEntries(EXPORT_FIELDS.map((k) => [k, session[k] ?? null])), null, 2)
 }
 
-/** 生成紧凑的“恢复上下文” Markdown，供粘贴到新会话继续。 */
+/**
+ * 生成紧凑的“恢复上下文” Markdown，供粘贴到新会话继续。
+ * 选项单位均为 UTF-16 code unit；预算总量 ≈ goalChars + maxMessages×maxCharsPerMessage（默认 ≈ 3.9K，语料最坏实测 ≈ 5.2KB）。
+ * @param {number} maxMessages 纳入的最近消息条数（<=0 表示只保留原目标、不带最近进展；审查 I3）
+ * @param {number} maxCharsPerMessage 每条最近消息的裁剪长度
+ * @param {number} goalChars 原目标（首条用户消息）的裁剪长度
+ */
 export function buildResumeContext(session, { maxMessages = 6, maxCharsPerMessage = 400, goalChars = 1500 } = {}) {
   const firstUser = session.messages.find((m) => m.role === 'user')
-  const recent = session.messages.slice(-maxMessages)
+  const recent = maxMessages > 0 ? session.messages.slice(-maxMessages) : []
   return [
     `# 请继续这个 Codex 会话：${session.title ?? session.id}`,
     `- 原项目目录: ${session.cwd ?? '?'}`,
@@ -2077,14 +2145,25 @@ export function renderExport(session, format) {
 **Step 4: 跑测试确认通过**
 
 Run: `node --test packages/core/tests/export.test.js`
-Expected: PASS（3 tests）
+Expected: PASS（8 tests）
+
+Run: `node --test "packages/core/tests/*.test.js"`
+Expected: PASS（48 tests：paths 6 + reader 11 + catalog 9 + mutate 14 + export 8）
 
 **Step 5: Commit**
 
 ```bash
-git add packages/core/src/export.js packages/core/tests/export.test.js
-git commit -m "feat(core): MD/JSON 导出与恢复上下文生成"
+git add packages/core/src/export.js packages/core/tests/export.test.js docs/plans/2026-09-26-codex-session-manager.md
+git commit -m "fix(core): 导出质量审查修复（JSON 字段白名单、代理对边界、窗口下限 + 补测）"
 ```
+
+**质量审查修订（2026-09-26）**：质量审查用真实语料全量扫描（650 文件 / 4.7GB，含 1GB·4228 消息极端会话）确认 export 四函数 0 崩溃、fallback/clip 契约在真实极值成立后，门控以下修复（上文 Step 1/Step 3 代码块已同步修订）：
+- **I1（Important）**：`toJson` 原为 `JSON.stringify(session)`，会把上层（web/MCP loader）临时挂载的 `archived`/`mtimeMs` 一并写入 Task 10 持久化的 JSON 工件——机器本地 FS 状态使同一会话导出不可逐字节复现。修正：`EXPORT_FIELDS` 白名单（保留 reader 全保真字段含 badLines，排除一切临时挂载）。
+- **I2（Minor）**：`clip` 按 UTF-16 code unit 切片会在代理对中间断开（真实语料字节级复现：🎉 前产生孤立高位代理，落盘成 U+FFFD）。修正：切点若落在高位代理则回退 1（保持 UTF-16 预算语义、O(1)）。
+- **I3（Minor）**：`slice(-maxMessages)` 在 `maxMessages<=0` 时反转（0 → 取全部）。修正：`maxMessages>0 ? slice(-maxMessages) : []`。
+- **I7（Minor）**：`buildResumeContext` 补 options JSDoc（单位=code unit、预算公式）。
+- **测试缺口**：#2 窗口化/默认值（must——headline resume 特性核心契约此前零回归保护，唯一生产消费者 web `/resume` 只用默认值）；#1 `renderExport(s,'md')` 独立分支断言（Task 10 export 默认格式）；#3 `title??id` 回退（真实 ~35% 会话无索引标题）；#4 代理对回归。另为两处代码修复补判别性回归：I1 toJson 白名单（挂 `archived`/`mtimeMs` 后断言被排除、`badLines` 保留）、I3 `maxMessages<=0` 只留原目标。共 +5 tests、改 1 test → export 8 tests。
+- **记录为可接受/延后**（不阻塞合并）：I4 消息原文含 `##`/``` 直嵌 markdown（人读工件、非安全边界；42% 会话有标题行、0.9% 有奇数围栏——转义会毁掉合法代码块，故接受）；I5 resume 被 `# Files mentioned by the user` 桌面脚手架挤占预算（根因在 reader 注入前缀未覆盖该 wrapper，**延后到 Task 9 UX pass 用真实 paste-heavy 会话验证**）；I6 最近进展条目间空行/短会话目标重复（Task 9 打磨）。renderExport 大小写敏感、100KB 消息直 dump 等经探查后 dismiss。
 
 ---
 
