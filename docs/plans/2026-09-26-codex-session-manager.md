@@ -3200,6 +3200,18 @@ git commit -m "feat(web): 会话面板前端（列表/搜索/详情/统计/操�
 
 > 设计要点：工具逻辑写成普通 async 函数（`createSessionTools`），`server.mjs` 只做 MCP 接线。测试直接调函数，不经 stdio。
 
+> **Task 10 前置修订（2026-09-26，控制器预审，派发前）**——对照已装 core 契约（catalog/reader/paths/export）与设计文档核验 Step 1/3，两处应修已直接改入下方代码块：
+> 1. **countBy 空原型（与 Task 7 stats I2 同款）**：原 `const o = {}` 用 Object 原型对象计数。工具名（`toolCalls`）来自语料 `function_call.name`，reader 不校验——构造的 `'constructor'` 会读到 `Object.prototype.constructor`（函数）再字符串拼接成脏值 `'function Object()…1'`，`'__proto__'` 的赋值则被 `__proto__` setter 吞掉（计数静默丢失）。改为 `Object.create(null)` 后两者都能正确计数；**无全局原型污染**（脏值只是 own property），但为与 Task 7 已确立的标准一致、避免质量审查按同一尺度打回，现在就修。MCP 出口是 `JSON.stringify`，null-proto 序列化结果与普通对象逐字节相同，Task 11 接线不受影响。
+> 2. **连带改 Step 1 测试 1 的断言**：`node:assert/strict` 下 `assert.deepEqual` 即 `deepStrictEqual`，**会校验原型**——null-proto 的 `toolCallCounts` 直接 deepEqual 普通字面量 `{exec_command:1}` 会因原型不符而失败。改为 `assert.deepEqual({ ...detail.toolCallCounts }, { exec_command: 1 })`（展开成 Object 原型副本再比），语义不变（仍断言"恰一个 exec_command 计数 1"）。
+> 3. **load() 标题兜底 `?? session.id` → `?? null`（对齐 web detail / Task 8 I6）**：`get_session` 已单独返回 `id` 字段，标题再兜底成 UUID 属冗余；改 `?? null` 后 (a) `get_session` 的 `title=null` 诚实表示"无标题"、与 web `/api/sessions/:id` 一致；(b) `export_session format=json` 的 `title=null` 与 web JSON 导出一致（数据保真，不把 id 冒充 title）；(c) **MD 导出标题不受影响**——`renderExport→toMarkdown` 内部是 `session.title ?? session.id`，null 会再次兜底成 UUID（`# a`），信息量不减。测试 1 有 index 标题（`'会话A'`）、测试 3 不断言 title，故两处测试均不破。
+>
+> **已核实无需改动的事实**（预审验证，避免实现者误判）：
+> - `readIndex` 对缺失 `session_index.jsonl` 返回**空 Map**（catalog.js:13 `ENOENT→return map`），故测试 3 不写 index 时 `load()` 不抛、`index.get('a')?.title` 为 `undefined`→兜底 `null`。
+> - `anchor(root,p)`（paths.js:31）对**相对路径** `resolve(root,p)` 解析进 home、对 home 外**绝对路径**经 `assertInside` 抛 `CsmError('invalid')`——精确匹配测试 3 的三条断言（默认 `exports/a.md`、相对 `rel.md`→`home/rel.md`、`/etc/evil.md`→invalid）。`export_session` 中 `renderExport(s,format)` 在构造 dest **之前**调用，非法 format 先抛 invalid，`${id}.${format}` 不会拿到非法扩展名；非法 id 则先被 `load()` 的 not_found 挡住。
+> - **6 个工具面与设计文档逐条一致**（design line 105-110：list/get/rename/archive/delete/export）；`resume`/`stats` 是 **web 专属**端点（design line 100-101），MCP 不暴露属**有意设计**，非遗漏。`archive_session`/`delete_session` 只透传 `force`、不带 `expectedMtimeMs`——陈旧防护是 web UI 的乐观并发特性，MCP 侧由 core 的 30s 活跃写入防护兜底，符合设计。
+>
+> **给 Task 11（SKILL.md）的待办**：`get_session` 返回**完整 messages**（无截断），真实语料存在 640+ 消息的会话，单次响应可能很大（token 成本 / MCP 帧）。SKILL.md 应引导：浏览用 `list_sessions`、续接理解用 `get_session`（注意大会话）、归档/全量用 `export_session`；如需紧凑续接上下文，web 侧的 resume 才是该形态（MCP v0.1 不提供 resume 工具）。
+
 **Step 1: 写失败测试** `packages/plugin/tests/tools.test.js`
 
 ```js
@@ -3222,7 +3234,7 @@ test('list_sessions / get_session', async () => {
   const detail = await tools.get_session({ id: 'a' })
   assert.equal(detail.title, '会话A')
   assert.ok(detail.messages.some((m) => m.text === '目标A'))
-  assert.deepEqual(detail.toolCallCounts, { exec_command: 1 })
+  assert.deepEqual({ ...detail.toolCallCounts }, { exec_command: 1 }) // countBy 返回 null-proto 对象，展开成普通对象再比（node:assert/strict 的 deepEqual 即 deepStrictEqual，会查原型）
   await assert.rejects(() => tools.get_session({ id: 'nope' }), (e) => e.code === 'not_found')
 })
 
@@ -3264,7 +3276,9 @@ import { dirname, join } from 'node:path'
 import * as core from '@csm/core'
 
 function countBy(arr) {
-  const o = {}
+  // 空原型：工具名来自语料，构造的 'constructor'/'__proto__' 若落到 Object 原型对象上会产生脏值或丢计数
+  // （与 Task 7 stats I2 同款）；null-proto 下两者都能正确计数，且 JSON 序列化（MCP 出口）不受影响。
+  const o = Object.create(null)
   for (const x of arr) o[x] = (o[x] ?? 0) + 1
   return o
 }
@@ -3278,7 +3292,7 @@ export function createSessionTools({ home } = {}) {
     if (!found) throw new core.CsmError('not_found', `session ${id} not found`)
     const session = await core.readSessionFile(found.path)
     const index = await core.readIndex(H)
-    session.title = index.get(id)?.title ?? session.id
+    session.title = index.get(id)?.title ?? null // 对齐 web detail（Task 8 I6）：null=无标题；get_session 已单独返回 id，无需 UUID 兜底；renderExport 内部仍 ?? session.id 故 MD 标题保留 UUID
     session.archived = found.location !== 'active'
     return session
   }
