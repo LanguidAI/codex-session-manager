@@ -1,1 +1,36 @@
-<!doctype html><meta charset="utf-8"><title>CSM</title>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSM · Codex 会话管理器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>🗂️ Codex 会话管理器</h1>
+  <nav>
+    <button id="tab-sessions" class="tab active">会话</button>
+    <button id="tab-stats" class="tab">统计</button>
+  </nav>
+</header>
+<main>
+  <section id="view-sessions">
+    <div class="toolbar">
+      <input id="q" type="search" placeholder="搜索标题 / ID / 项目目录…">
+      <input id="cwd" type="text" placeholder="项目目录包含…">
+      <select id="model"><option value="">全部模型</option></select>
+      <label class="chk"><input id="archived" type="checkbox"> 含归档</label>
+      <span id="count" class="count"></span>
+    </div>
+    <div class="layout">
+      <ul id="list"></ul>
+      <aside id="detail"><p class="empty">选择左侧会话查看详情</p></aside>
+    </div>
+  </section>
+  <section id="view-stats" hidden></section>
+</main>
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

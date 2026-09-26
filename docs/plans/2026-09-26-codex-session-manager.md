@@ -2847,6 +2847,15 @@ git commit -m "feat(web): REST API 服务（bearer 鉴权、错误映射、静�
 
 > 前端无自动化测试（无构建、无框架）；用 Step 5 的手动验证清单代替。UI 文案用中文。
 
+**前置修订（2026-09-26，控制器预审——对照已定稿的 Task 8 API 契约 + Task 6/7/8 携带待办）：**
+
+1. **I7（expectedMtimeMs 回填，必修）**：原 archive/delete 发 `body:'{}'`，未带 `expectedMtimeMs` → Task 5 的陈旧守卫（mtime 与读取时不符 → 409 conflict）在 UI 路径形同虚设。修：`selectSession` 存 `state.detailMtime = s.mtimeMs`（Task 8 loadFull 已透出），archive/delete 发 `body: JSON.stringify({ expectedMtimeMs: state.detailMtime })`。
+2. **I6（title null 渲染，必修）**：Task 8 的 I6 修复后，无索引标题的会话 detail 返回 `title=null`；原 `<h2>${esc(s.title)}</h2>` → `esc(null)`='null' → 详情页标题显示字面 "null"。修：`esc(s.title ?? '(未命名)')`（list 侧用 listSessions 的 '(未命名)' 兜底、永不为 null，无需改）。
+3. **Task 7 Issue 1（byDay 排序，必修）**：原 `rows(s.byDay,14)` 按**计数**降序 → "最近 14 天"实际渲染**最忙的** 14 天（真实语料为 7/8 月），与标签矛盾。修：新增 `dayRows`（按**日期键** `b[0].localeCompare(a[0])` 降序取最近 N 天），byDay 用它；其余三个 by\* 仍按计数 `rows()`。
+4. **Task 8 判定（延迟 → 客户端过滤）+ 现存下拉 bug**：list 每次需全语料 fastMeta 扫描（真实 ~0.9–1.3s），原实现每次按键/切换都服务端往返 → 迟滞。且原 `loadList` 从**过滤后结果**重填模型下拉 → 选中某模型后下拉只剩该模型、无法切换（现存 bug）。修：拆 `refresh()`（一次拉取 `?archived=1` 全量、缓存 `state.all`、从全量填模型下拉）+ `renderList()`（纯客户端过滤，瞬时）；过滤输入直接调 `renderList()`（去掉 250ms debounce 与服务端 query）；变更后 `refresh().then(renderList)`。客户端过滤语义与 core `listSessions` 一致（q=标题/ID/项目小写子串、cwd=小写子串、model=精确、archived=含归档）；resume 分片同 id 共享元数据，服务端先去重再客户端过滤 ≡ 服务端过滤，边缘差异可忽略。
+5. **F（conflict 友好提示，小）**：catch 原只特判 `active`；补 `conflict` → "会话自读取后已变化，请重新选择后再试"（配合 I7 的陈旧守卫）。
+6. **延后/已验证**：Task 6 的 I6 打磨（resume 上下文 `\n\n` 间距、<6 消息时 goal 与窗口重叠）属 **core/export.js 内容**、Task 6 已批准，不在前端任务里改 → 归 Task 13 遗留 Minor 包；Task 6 的 I5（resume 预算被 `# Files mentioned by the user` 挤占）已在 Task 6 质量审查用真实 427 消息会话验证"可续"，本任务 Step 5 再顺带目测。
+
 **Step 1: 写 `packages/web/public/index.html`**
 
 ```html
@@ -2950,7 +2959,7 @@ const token = sessionStorage.getItem('csm-token') ?? params.get('token')
 if (params.get('token')) sessionStorage.setItem('csm-token', params.get('token'))
 
 const $ = (sel) => document.querySelector(sel)
-const state = { sessions: [], selected: null, view: 'sessions' }
+const state = { sessions: [], selected: null, view: 'sessions', all: [], detailMtime: null }
 
 function toast(msg, isErr = false) {
   const el = $('#toast')
@@ -2977,13 +2986,30 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const fmtTime = (iso) => (iso ? iso.replace('T', ' ').slice(0, 16) : '?')
 const fmtSize = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)}MB` : `${Math.max(1, Math.round(n / 1024))}KB`)
 
-async function loadList() {
-  const q = new URLSearchParams()
-  if ($('#q').value) q.set('q', $('#q').value)
-  if ($('#cwd').value) q.set('cwd', $('#cwd').value)
-  if ($('#model').value) q.set('model', $('#model').value)
-  if ($('#archived').checked) q.set('archived', '1')
-  const { sessions } = await api(`/api/sessions?${q}`)
+// 一次拉全量（含归档）缓存到客户端；模型下拉从全量填一次（修复旧版从过滤结果重填、选中某模型后下拉只剩该模型的 bug）。
+// 列表需全语料 fastMeta 扫描（真实 ~0.9–1.3s，见 Task 8 审查），故过滤一律走客户端、瞬时完成，不再每次往返服务端。
+async function refresh() {
+  const { sessions } = await api('/api/sessions?archived=1')
+  state.all = sessions
+  const models = [...new Set(sessions.map((s) => s.model).filter(Boolean))].sort()
+  const sel = $('#model')
+  const cur = sel.value
+  sel.innerHTML = '<option value="">全部模型</option>' + models.map((m) => `<option value="${esc(m)}" ${m === cur ? 'selected' : ''}>${esc(m)}</option>`).join('')
+}
+
+// 客户端过滤（语义与 core listSessions 一致：q=标题/ID/项目小写子串、cwd=小写子串、model=精确、archived=含归档）。
+function renderList() {
+  const q = $('#q').value.trim().toLowerCase()
+  const cwd = $('#cwd').value.trim().toLowerCase()
+  const model = $('#model').value
+  const showArchived = $('#archived').checked
+  const sessions = state.all.filter((s) => {
+    if (!showArchived && s.archived) return false
+    if (model && s.model !== model) return false
+    if (cwd && !(s.cwd ?? '').toLowerCase().includes(cwd)) return false
+    if (q && ![s.title, s.id, s.cwd ?? ''].some((f) => String(f).toLowerCase().includes(q))) return false
+    return true
+  })
   state.sessions = sessions
   $('#count').textContent = `${sessions.length} 个会话`
   $('#list').innerHTML = sessions.map((s) => `
@@ -2997,19 +3023,15 @@ async function loadList() {
         ${s.archived ? '<span class="badge arch">已归档</span>' : ''}
       </div>
     </li>`).join('') || '<li>无匹配会话</li>'
-  // 填充模型下拉（保留当前选择）
-  const models = [...new Set(sessions.map((s) => s.model).filter(Boolean))]
-  const sel = $('#model')
-  const cur = sel.value
-  sel.innerHTML = '<option value="">全部模型</option>' + models.map((m) => `<option ${m === cur ? 'selected' : ''}>${esc(m)}</option>`).join('')
 }
 
 async function selectSession(id) {
   state.selected = id
   document.querySelectorAll('#list li').forEach((li) => li.classList.toggle('sel', li.dataset.id === id))
   const { session: s } = await api(`/api/sessions/${encodeURIComponent(id)}`)
+  state.detailMtime = s.mtimeMs // 乐观并发：archive/delete 回填 expectedMtimeMs（Task 8 I7）
   $('#detail').innerHTML = `
-    <h2>${esc(s.title)}</h2>
+    <h2>${esc(s.title ?? '(未命名)')}</h2>
     <div class="meta">ID: ${esc(s.id)} · ${esc(s.cwd ?? '?')} · ${esc(s.model ?? '?')} (${esc(s.provider ?? '?')}) · ${fmtTime(s.createdAt)} → ${fmtTime(s.updatedAt)} · tokens: ${s.tokens ?? '?'}</div>
     <div class="actions">
       <button data-act="rename">✏️ 重命名</button>
@@ -3042,7 +3064,8 @@ $('#detail').addEventListener('click', async (ev) => {
       if (!title) return
       await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) })
       toast('已重命名')
-      await loadList()
+      await refresh()
+      renderList()
       await selectSession(id)
     } else if (act === 'resume') {
       const { text } = await api(`/api/sessions/${encodeURIComponent(id)}/resume`)
@@ -3054,21 +3077,26 @@ $('#detail').addEventListener('click', async (ev) => {
       await download(`/api/sessions/${encodeURIComponent(id)}/export?fmt=json`, `${id}.json`)
     } else if (act === 'archive') {
       if (!confirm('归档该会话？（移入 archived_sessions，可手动移回）')) return
-      await api(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', body: '{}' })
+      await api(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify({ expectedMtimeMs: state.detailMtime }) })
       toast('已归档')
       state.selected = null
       $('#detail').innerHTML = '<p class="empty">选择左侧会话查看详情</p>'
-      await loadList()
+      await refresh()
+      renderList()
     } else if (act === 'delete') {
       if (!confirm('删除该会话？（软删除：移入 .csm-trash 并先备份，不会物理删除）')) return
-      await api(`/api/sessions/${encodeURIComponent(id)}/delete`, { method: 'POST', body: '{}' })
+      await api(`/api/sessions/${encodeURIComponent(id)}/delete`, { method: 'POST', body: JSON.stringify({ expectedMtimeMs: state.detailMtime }) })
       toast('已移入回收站')
       state.selected = null
       $('#detail').innerHTML = '<p class="empty">选择左侧会话查看详情</p>'
-      await loadList()
+      await refresh()
+      renderList()
     }
   } catch (e) {
-    toast(e.code === 'active' ? '会话正被 Codex 使用中，稍后再试' : `失败：${e.message}`, true)
+    const msg = e.code === 'active' ? '会话正被 Codex 使用中，稍后再试'
+      : e.code === 'conflict' ? '会话自读取后已变化，请重新选择后再试'
+      : `失败：${e.message}`
+    toast(msg, true)
   }
 })
 
@@ -3077,18 +3105,19 @@ $('#list').addEventListener('click', (ev) => {
   if (li) selectSession(li.dataset.id).catch((e) => toast(e.message, true))
 })
 
-let debounce
+// 过滤一律客户端（renderList 同步瞬时），不再 debounce/服务端往返
 for (const sel of ['#q', '#cwd', '#model', '#archived']) {
-  $(sel).addEventListener(sel === '#model' || sel === '#archived' ? 'change' : 'input', () => {
-    clearTimeout(debounce)
-    debounce = setTimeout(() => loadList().catch((e) => toast(e.message, true)), 250)
-  })
+  $(sel).addEventListener(sel === '#model' || sel === '#archived' ? 'change' : 'input', () => renderList())
 }
 
 async function loadStats() {
   const s = await api('/api/stats')
   const rows = (obj, limit = 10) =>
     Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, limit)
+      .map(([k, v]) => `<div class="row"><span>${esc(k)}</span><b>${v}</b></div>`).join('')
+  // byDay 是时间序列：按日期键降序取最近 N 天（勿按计数排序，否则"最近 14 天"变成"最忙 14 天"——Task 7 Issue 1）
+  const dayRows = (obj, limit = 14) =>
+    Object.entries(obj).sort((a, b) => b[0].localeCompare(a[0])).slice(0, limit)
       .map(([k, v]) => `<div class="row"><span>${esc(k)}</span><b>${v}</b></div>`).join('')
   $('#view-stats').innerHTML = `
     <div class="cards">
@@ -3100,7 +3129,7 @@ async function loadStats() {
       <div class="box"><h3>按项目目录</h3>${rows(s.byProject)}</div>
       <div class="box"><h3>按模型</h3>${rows(s.byModel)}</div>
       <div class="box"><h3>按供应商</h3>${rows(s.byProvider)}</div>
-      <div class="box"><h3>按日期（最近 14 天）</h3>${rows(s.byDay, 14)}</div>
+      <div class="box"><h3>按日期（最近 14 天）</h3>${dayRows(s.byDay, 14)}</div>
     </div>`
 }
 
@@ -3118,33 +3147,37 @@ $('#tab-stats').addEventListener('click', () => switchView('stats'))
 if (!token) {
   toast('URL 缺少 ?token=，请使用服务启动时打印的完整地址', true)
 } else {
-  loadList().catch((e) => toast(e.message, true))
+  refresh().then(renderList).catch((e) => toast(e.message, true))
 }
 ```
 
 **Step 4: 跑 web 测试回归**
 
 Run: `node --test packages/web/tests/api.test.js`
-Expected: PASS（静态页测试现在验证的是完整 index.html，仍应通过）
+Expected: PASS（11/11；本任务只改前端三件套，api.test.js 不动。静态页测试断言 `/` → 200 text/html，完整 index.html 仍按 text/html 服务故通过；app.js/style.css 由静态处理按 MIME 服务，测试不断言其内容）
+
+Run: `node --test 'packages/*/tests/*.test.js'`
+Expected: PASS（66/66：core 55 + web 11）
 
 **Step 5: 手动验证（真实数据只读操作）**
 
 Run: `cd /Users/xuxianxian/Documents/test/codex-session-manager && (CODEX_HOME=$HOME/.codex node packages/web/server.mjs &); sleep 1`
 然后从 stdout 拿 `http://127.0.0.1:4173/?token=...` 用浏览器打开，核对清单：
 - [ ] 会话列表显示真实会话（标题/时间/项目/模型）
-- [ ] 搜索关键字能过滤
-- [ ] 点开详情能看到消息流
-- [ ] 「复制恢复上下文」提示成功，粘贴可见 Markdown
+- [ ] 搜索关键字、项目目录、模型过滤都生效且**瞬时响应**（客户端过滤，无 ~1s 迟滞——前置修订 4）
+- [ ] **选中某模型后，模型下拉仍列出其它模型、可切换**（修复旧版从过滤结果重填导致下拉收缩的 bug——前置修订 4）
+- [ ] 点开详情能看到消息流；**无标题会话详情标题显示「(未命名)」而非「null」**（前置修订 2）
+- [ ] 「复制恢复上下文」提示成功，粘贴可见 Markdown（顺带目测 resume 上下文可读、未被 `# Files mentioned by the user` 挤占——Task 6 I5）
 - [ ] 「导出 MD」下载的文件内容正确
-- [ ] 统计页数字与列表总数一致
-- [ ] ⚠️ 本步骤**不要**在真实数据上点归档/删除（那些留给验收阶段用测试会话验证）
+- [ ] 统计页数字与列表总数一致；**「按日期（最近 14 天）」显示最近的日期（按日期降序）而非最忙的日期**（前置修订 3）
+- [ ] ⚠️ 本步骤**不要**在真实数据上点归档/删除（留给验收阶段用测试会话验证，含 I7 expectedMtimeMs 冲突路径）
 验证完 `kill %1` 关掉服务。
 
 **Step 6: Commit**
 
 ```bash
-git add packages/web/public/
-git commit -m "feat(web): 会话面板前端（列表/搜索/详情/统计/操作按钮，原生无构建）"
+git add packages/web/public/ docs/plans/2026-09-26-codex-session-manager.md
+git commit -m "feat(web): 会话面板前端（列表/搜索/详情/统计/操作按钮，原生无构建；客户端过滤+expectedMtimeMs 回填+title/byDay 修正）"
 ```
 
 ---
