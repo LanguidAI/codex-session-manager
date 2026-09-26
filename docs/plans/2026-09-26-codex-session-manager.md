@@ -3657,15 +3657,20 @@ async function fakePluginDir() {
   const dir = join(await makeHome(), 'plugin-src')
   await mkdir(join(dir, '.codex-plugin'), { recursive: true })
   await mkdir(join(dir, 'skills', 'session-manager'), { recursive: true })
+  await mkdir(join(dir, 'node_modules', 'dep'), { recursive: true })
+  await mkdir(join(dir, 'tests'), { recursive: true })
   await writeFile(join(dir, '.codex-plugin', 'plugin.json'), '{"name":"session-manager"}')
   await writeFile(join(dir, 'skills', 'session-manager', 'SKILL.md'), '---\nname: session-manager\n---\n')
   await writeFile(join(dir, 'server.mjs'), '// stub')
+  await writeFile(join(dir, 'node_modules', 'dep', 'index.js'), '// dep')
+  await writeFile(join(dir, 'tests', 'old.test.js'), '// old')
+  await writeFile(join(dir, 'mytests.js'), '// 含 "tests" 子串但为合法根文件（cp filter 段级匹配的判别器）')
   return dir
 }
 
 const BASE_CONFIG = `model = "x"\n\n[desktop]\nlocaleOverride = "zh-CN"\n\n[marketplaces.openai-bundled]\nsource_type = "local"\nsource = "/some/where"\n`
 
-test('upsertTomlSection: 追加新节 / 原地更新 / 不动其他节', () => {
+test('upsertTomlSection: 追加新节 / 原地更新 / 不动其他节 / 尾随注释 / CRLF', () => {
   let t = upsertTomlSection(BASE_CONFIG, '[marketplaces.csm]', ['source_type = "local"', 'source = "/m"'])
   assert.ok(t.includes('[marketplaces.csm]'))
   assert.ok(t.includes('source = "/m"'))
@@ -3675,36 +3680,78 @@ test('upsertTomlSection: 追加新节 / 原地更新 / 不动其他节', () => {
   assert.equal(again.split('[marketplaces.csm]').length, 2, '不重复追加')
   assert.ok(again.includes('source = "/m2"'))
   assert.ok(!again.includes('source = "/m"\n'), '旧值被替换')
+  // I1a：header 带尾随注释须被原地替换（旧正则不匹配 → 重复追加 → TOML 非法 "Cannot declare twice"）
+  const commented = upsertTomlSection('[marketplaces.csm] # my market\nsource = "/old"\n', '[marketplaces.csm]', ['source = "/new"'])
+  assert.equal(commented.split('[marketplaces.csm]').length, 2, '尾随注释 header：原地替换不重复')
+  assert.ok(commented.includes('source = "/new"') && !commented.includes('source = "/old"'), '尾随注释 header：旧值被替换')
+  // Info10：CRLF 配置二次 upsert 不得重复（ECMAScript m 标志 $ 匹配 \r 前）
+  const crlf1 = upsertTomlSection(BASE_CONFIG.replace(/\n/g, '\r\n'), '[marketplaces.csm]', ['source = "/c"'])
+  const crlf2 = upsertTomlSection(crlf1, '[marketplaces.csm]', ['source = "/c2"'])
+  assert.equal(crlf2.split('[marketplaces.csm]').length, 2, 'CRLF：不重复')
 })
 
-test('removeTomlSection: 只删目标节', () => {
+test('removeTomlSection: 只删目标节 / 尾随注释 / CRLF', () => {
   const t = removeTomlSection(BASE_CONFIG, '[desktop]')
   assert.ok(!t.includes('[desktop]'))
   assert.ok(!t.includes('localeOverride'))
   assert.ok(t.includes('[marketplaces.openai-bundled]'))
+  // I1a：header 带尾随注释须能正确删除
+  const tc = removeTomlSection('[marketplaces.csm] # note\nsource = "/x"\n\n[desktop]\nk = 1\n', '[marketplaces.csm]')
+  assert.ok(!tc.includes('[marketplaces.csm]') && !tc.includes('source = "/x"'), '尾随注释 header：节被删除')
+  assert.ok(tc.includes('[desktop]'), '尾随注释 header：其他节保留')
+  // Info10：CRLF 删除不留碎片
+  const cr = removeTomlSection(BASE_CONFIG.replace(/\n/g, '\r\n'), '[desktop]')
+  assert.ok(!cr.includes('[desktop]') && !cr.includes('localeOverride'), 'CRLF：节被删除')
+  assert.ok(cr.includes('[marketplaces.openai-bundled]'), 'CRLF：其他节保留')
 })
 
-test('installPlugin: 市场目录 + 清单 + config 条目 + 备份 + 幂等', async () => {
+test('installPlugin: 市场目录 + 清单 + config 条目 + 备份 + cp过滤 + 幂等', async () => {
   const home = await makeHome()
   await writeFile(join(home, 'config.toml'), BASE_CONFIG)
   const pluginDir = await fakePluginDir()
   await installPlugin({ home, pluginDir })
   const market = join(home, 'marketplaces', 'csm')
-  await stat(join(market, '.agents', 'plugins', 'marketplace.json'))
-  await stat(join(market, 'plugins', 'session-manager', '.codex-plugin', 'plugin.json'))
-  const mcp = JSON.parse(await readFile(join(market, 'plugins', 'session-manager', '.mcp.json'), 'utf8'))
+  const dest = join(market, 'plugins', 'session-manager')
+  // M5c：marketplace.json 可解析且结构正确（不只是 stat 存在）
+  const mj = JSON.parse(await readFile(join(market, '.agents', 'plugins', 'marketplace.json'), 'utf8'))
+  assert.equal(mj.name, 'csm')
+  assert.equal(mj.plugins[0].name, 'session-manager')
+  assert.equal(mj.plugins[0].source.source, 'local')
+  await stat(join(dest, '.codex-plugin', 'plugin.json'))
+  const mcp = JSON.parse(await readFile(join(dest, '.mcp.json'), 'utf8'))
   assert.equal(mcp.mcpServers.session_manager.cwd, pluginDir, 'MCP 指向仓库内 server（依赖解析可用）')
   assert.ok(mcp.mcpServers.session_manager.args[0].endsWith('server.mjs'))
+  // I2 + M5a：cp filter 段级匹配——node_modules/tests 排除，含 "tests" 子串的合法文件（mytests.js）保留
+  const copied = await readdir(dest)
+  assert.ok(!copied.includes('node_modules'), 'cp filter：node_modules 未复制')
+  assert.ok(!copied.includes('tests'), 'cp filter：tests 未复制')
+  assert.ok(copied.includes('mytests.js'), 'cp filter：段级匹配不误伤 mytests.js（旧子串匹配会丢弃）')
+  assert.ok(copied.includes('server.mjs'), 'cp filter：所需文件保留')
+  // config.toml 条目
   const cfg = await readFile(join(home, 'config.toml'), 'utf8')
   assert.ok(cfg.includes('[marketplaces.csm]'))
   assert.ok(cfg.includes('[plugins."session-manager@csm"]'))
   assert.ok(cfg.includes('enabled = true'))
   assert.ok(cfg.includes('localeOverride'), '用户原配置未破坏')
+  // M5b：备份存在且内容 == 安装前原配置（不只是查存在）
   const bakFiles = (await readdir(home)).filter((f) => f.startsWith('config.toml.bak-csm-'))
   assert.ok(bakFiles.length >= 1, 'config.toml 修改前已备份')
-  await installPlugin({ home, pluginDir }) // 幂等
+  assert.equal(await readFile(join(home, bakFiles[0]), 'utf8'), BASE_CONFIG, '备份内容 == 安装前原配置')
+  // 幂等
+  await installPlugin({ home, pluginDir })
   const cfg2 = await readFile(join(home, 'config.toml'), 'utf8')
   assert.equal(cfg2.split('[marketplaces.csm]').length, 2)
+})
+
+test('installPlugin 自检：重复节配置拒绝写入（保护用户 config 不被损坏）', async () => {
+  const home = await makeHome()
+  // 构造已含重复 [marketplaces.csm] 的配置（模拟正则编辑可能产生的损坏）
+  await writeFile(join(home, 'config.toml'), '[marketplaces.csm]\na = 1\n[marketplaces.csm]\nb = 2\n')
+  const pluginDir = await fakePluginDir()
+  await assert.rejects(() => installPlugin({ home, pluginDir }), /self-check|duplicate|重复/i, '重复节触发自检，拒绝写入')
+  // 自检在写入前触发 → 原 config 未被覆盖（仍是 2 个重复节 = split 长度 3）
+  const cfg = await readFile(join(home, 'config.toml'), 'utf8')
+  assert.equal(cfg.split('[marketplaces.csm]').length, 3, '原 config 未被改动')
 })
 
 test('uninstallPlugin: 移除条目与市场目录，保留其他配置', async () => {
@@ -3736,8 +3783,9 @@ Expected: FAIL，`Cannot find module '.../install.mjs'`
  * 2) 备份并更新 $CODEX_HOME/config.toml（[marketplaces.csm] + [plugins."session-manager@csm"]）
  * --uninstall 反向移除。
  */
+import { realpathSync } from 'node:fs'
 import { copyFile, cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { codexHome } from '@csm/core'
 
@@ -3749,10 +3797,19 @@ function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/** 在 TOML 文本中插入或原地替换一个节（节内容到下一个 [ 或文件尾为止）。 */
+/** 不抛错的 realpath（is-main 守卫用：argv[1] 异常时退回原值，避免 import 期崩溃）。 */
+function safeRealpath(p) {
+  try {
+    return realpathSync(p)
+  } catch {
+    return p
+  }
+}
+
+/** 在 TOML 文本中插入或原地替换一个节（节内容到下一个 [ 或文件尾为止）。header 行允许尾随注释。 */
 export function upsertTomlSection(text, header, lines) {
   const block = [header, ...lines].join('\n')
-  const re = new RegExp(`^${escapeRe(header)}[ \\t]*$`, 'm')
+  const re = new RegExp(`^${escapeRe(header)}[ \\t]*(?:#.*)?$`, 'm')
   const m = re.exec(text)
   if (!m) {
     const gap = text.length === 0 || text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n'
@@ -3765,9 +3822,9 @@ export function upsertTomlSection(text, header, lines) {
   return `${text.slice(0, m.index)}${block}\n\n${text.slice(end).replace(/^\n+/, '')}`
 }
 
-/** 从 TOML 文本中删除一个节（含其键值行）。 */
+/** 从 TOML 文本中删除一个节（含其键值行）。header 行允许尾随注释。 */
 export function removeTomlSection(text, header) {
-  const re = new RegExp(`^${escapeRe(header)}[ \\t]*$`, 'm')
+  const re = new RegExp(`^${escapeRe(header)}[ \\t]*(?:#.*)?$`, 'm')
   const m = re.exec(text)
   if (!m) return text
   const afterHeader = m.index + m[0].length
@@ -3775,6 +3832,16 @@ export function removeTomlSection(text, header) {
   const next = rest.search(/^\[/m)
   const end = next === -1 ? text.length : afterHeader + next
   return `${text.slice(0, m.index)}${text.slice(end).replace(/^\n+/, '')}`
+}
+
+/** 写前自检：构造出的 config 不得含重复节 header（正则 TOML 编辑的安全网，拒绝写坏配置）。 */
+function assertNoDuplicateSections(text) {
+  for (const header of [`[marketplaces.${MARKET_NAME}]`, `[plugins."${PLUGIN_NAME}@${MARKET_NAME}"]`]) {
+    const found = text.match(new RegExp(`^${escapeRe(header)}`, 'gm'))
+    if (found && found.length > 1) {
+      throw new Error(`config.toml self-check: duplicate section ${header} (${found.length}x), refusing to write (original config unchanged)`)
+    }
+  }
 }
 
 async function readConfig(home) {
@@ -3804,7 +3871,12 @@ export async function installPlugin({ home = codexHome(), pluginDir = HERE } = {
   await rm(dest, { recursive: true, force: true })
   await cp(pluginDir, dest, {
     recursive: true,
-    filter: (src) => !src.includes('node_modules') && !src.includes(`${join('tests', '')}`),
+    // 段级匹配：仅当 node_modules/tests 作为 relative(pluginDir) 路径的完整一段时排除
+    // （避免子串误伤：如 pluginDir 路径本身含 "tests"、或 mytests.js 这类合法文件）
+    filter: (src) => {
+      const segs = relative(pluginDir, src).split(sep)
+      return !segs.includes('node_modules') && !segs.includes('tests')
+    },
   })
   // .mcp.json 物化：MCP server 从仓库目录运行（保证 @csm/core 与 sdk 依赖可解析）
   const mcp = {
@@ -3839,6 +3911,7 @@ export async function installPlugin({ home = codexHome(), pluginDir = HERE } = {
   let cfg = await readConfig(home)
   cfg = upsertTomlSection(cfg, `[marketplaces.${MARKET_NAME}]`, ['source_type = "local"', `source = ${JSON.stringify(marketDir)}`])
   cfg = upsertTomlSection(cfg, `[plugins."${PLUGIN_NAME}@${MARKET_NAME}"]`, ['enabled = true'])
+  assertNoDuplicateSections(cfg) // 写前自检：发现重复节即拒绝写入（保护用户 config）
   await writeConfigWithBackup(home, cfg)
   return { marketDir, configPath: join(home, 'config.toml') }
 }
@@ -3852,12 +3925,12 @@ export async function uninstallPlugin({ home = codexHome() } = {}) {
   await rm(join(home, 'marketplaces', MARKET_NAME), { recursive: true, force: true })
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (process.argv[1] && safeRealpath(fileURLToPath(import.meta.url)) === safeRealpath(process.argv[1])) {
   const uninstall = process.argv.includes('--uninstall')
   const r = uninstall ? await uninstallPlugin() : await installPlugin()
   console.log(uninstall
     ? '已卸载 session-manager 插件（config.toml 已备份，市场目录已移除）。重启 Codex Desktop 生效。'
-    : `已安装 session-manager 插件 → ${r.marketDir}\nconfig.toml 已更新并备份。重启 Codex Desktop 后在插件列表启用即可。`)
+    : `已安装 session-manager 插件 → ${r.marketDir}\nconfig.toml 已更新（原文件存在时已备份）。重启 Codex Desktop 后在插件列表启用即可。`)
 }
 ```
 
@@ -3883,7 +3956,20 @@ git commit -m "feat(plugin): 本地 marketplace 安装/卸载脚本（config.tom
 > **核验 3 — CLI is-main 守卫（line 3855，npm run 生效、无需改）**：`fileURLToPath(import.meta.url)===process.argv[1]` 实证：**相对路径调用（`node sub/install.mjs`，即 `npm run install:plugin` 的方式）→ Node 把 argv[1] 解析为真实绝对路径、与 import.meta.url 一致、守卫触发 ✓**；npm run 场景同样触发 ✓。仅「绝对路径调用且路径经 symlink」（如 `node /tmp/…`，/tmp→/private/tmp）会因 argv[1] 保留未解析而守卫失败——但真实仓库路径无 symlink 组件、Task 13 走 npm run（相对），非真实路径（信息性记录）。
 >
 > **信息性（记录，不改）**：① `writeConfigWithBackup` 备份名仅 `Date.now()`（无随机后缀），同毫秒内两次写会碰撞致第二个备份覆盖第一个（对比 core mutate.js 用 `<ts>-<rand>/`）——真实安装单次运行不会触发，Task 13 可视需要加随机后缀；② TOML 正则假定「节头是行首未缩进 `[`、多行数组值缩进」（标准 TOML 风格），Codex config.toml 符合，Task 13 真实安装验证；③ `join('tests','')==='tests'` 写法略反直觉（作者本意或为 'tests/'），功能如上正确；④ marketplace.json/plugin.json 为 Codex marketplace schema、**暂定**（`PluginMcpServerConfig`/`default_tools_approval_mode` 已确认是真实 Codex 字段；marketplace 清单结构待 Task 13 真实安装核验）。
-> **依赖/契约已核实**：`cp`/`rm`/`copyFile`/`mkdir`/`readFile`/`readdir`/`stat`/`writeFile` 均在 node:fs/promises（cp 需 Node≥16.7、rm≥14.14，本仓 engines≥22）；`codexHome` 由 @csm/core barrel 导出；测试 import `makeHome` 自 core fixture（临时 home，绝不碰真实 ~/.codex）；install.test.js 的 4 测试与既有 tools.test.js 4 测试并存，**全套测试 70 → 74**。
+> **依赖/契约已核实**：`cp`/`rm`/`copyFile`/`mkdir`/`readFile`/`readdir`/`stat`/`writeFile`（node:fs/promises）+ `realpathSync`（node:fs）均在（cp 需 Node≥16.7、rm≥14.14，本仓 engines≥22）；`codexHome` 由 @csm/core barrel 导出；测试 import `makeHome` 自 core fixture（临时 home，绝不碰真实 ~/.codex）；install.test.js 与既有 tools.test.js 4 测试并存，~~全套测试 70 → 74~~ **（质量审查修订加第 5 个自检测试后 → 75，见下）**。
+
+> **Task 12 质量审查修订（2026-09-27，两阶审查之质量审查判「Approved With Fixes」后，控制器先修计划再派 fixer 走 TDD RED→GREEN；所有修复经控制器预先实证——RED 4 判别器 / GREEN 5 测试 / 全套 75 / tomllib 合法性 / ENOENT 场景 / 真实 ~/.codex shasum 前后一致零改动）**
+>
+> 质量审查（权威 severity 判定，28 个 TOML 对抗输入 + tomllib 独立校验 + 真实 ~/.codex 只读复核）确认 install/uninstall/备份/幂等端到端正确、74/74、真实语料零改动，但发现 **2 Important + 3 Minor**，按「Important 必修 + Minor 便宜即随修」全部修订：
+> **I1（Important）— 行正则 TOML 损坏 + 无自检**：① **header 尾随注释**（`[marketplaces.csm] # comment`）令旧正则 `[ \t]*$` 不匹配 → upsert 重复追加 → tomllib 报 "Cannot declare twice"（配置非法、Codex 读不了）而脚本仍打印成功；② 多行字符串/裸 `[` 行（i3–i6）可孤立碎片（需 Codex config writer 从不产出的形状，概率低）。**修**：(a) upsert/remove 两处 header 正则改 `[ \t]*(?:#.*)?$`（容忍尾随注释、原地替换/删除）；(b) 新增 `assertNoDuplicateSections(cfg)` 写前自检——`gm` 正则数 `^header` 出现次数，>1 即 `throw`（拒绝写、原 config 不动），作正则编辑安全网。**实证**：尾随注释 upsert/remove 输出经 tomllib 均 VALID（csm.source 正确、desktop 保留、幂等二次仍 VALID）；自检测试（预重复节 config → installPlugin rejects 且原 config split 长度不变=3）。
+> **I2（Important）— cp filter 子串匹配潜在 bug**：旧 `!src.includes('node_modules') && !src.includes('tests')` 为子串匹配——**pluginDir 绝对路径含 'tests' → cp filter 对根目录返回 false → 整棵树不复制 → 后续写 `.mcp.json` ENOENT（安装失败）**（质量审查于 my-tests-dir 实证）；相对路径含 'tests' 的合法文件（mytests.js）被静默丢弃。**修**：改段级匹配 `relative(pluginDir, src).split(sep)` 后查 `segs.includes('node_modules'/'tests')`（import 加 `relative, sep`）。**实证**：mytests.js 保留（判别器：旧子串匹配会丢）、node_modules/tests 排除、pluginDir 路径含 'tests'（my-tests-dir/plugin）现安装成功（dest 含 server.mjs）。
+> **M3（Minor）— is-main 守卫 symlink 路径失效**：旧 `fileURLToPath(import.meta.url)===process.argv[1]` 在「绝对路径经 symlink」调用时（argv[1] 未 realpath、import.meta.url 已 realpath）守卫 false → **静默 no-op exit 0**（用户以为装了）。**修**：新增 `safeRealpath`（不抛错 realpathSync，argv[1] 异常退回原值避免 import 期崩溃），守卫改 `safeRealpath(fileURLToPath(import.meta.url))===safeRealpath(process.argv[1])`（import 加 `realpathSync` from node:fs）。**实证**：`node --test`（单文件/glob）下 argv[1] 恒为测试文件已解析真实路径（≠install.mjs）→ 守卫正确 inert（真实 ~/.codex shasum 前后一致、marketplaces/csm 从未创建）；`npm run install:plugin`（相对路径）守卫触发。
+> **M4（Minor）— fresh-home 消息谎称备份**：原 config.toml 不存在时 writeConfigWithBackup 不备份（stat ENOENT 跳过），CLI 消息却说「已更新并备份」。**修**：install 成功消息改「config.toml 已更新（原文件存在时已备份）」。
+> **M5（Minor）— 测试缺口补齐**：① fakePluginDir 加 `node_modules/dep`、`tests/`、`mytests.js`（子串陷阱），test 3 断言 cp filter（node_modules/tests 排除、mytests.js/server.mjs 保留）——**套件首次真正验证 cp filter**（mytests.js 即 I2 的 RED/GREEN 判别器）；② 备份断言强化为内容 == 安装前 BASE_CONFIG（非仅查存在）；③ marketplace.json parse 并断言结构（name/plugins[0].name/source.source，非仅 stat）；④ **新增第 5 个测试**「自检：重复节配置拒绝写入」（I1b 的 RED/GREEN 判别器）。**install.test.js 4 → 5 测试，全套 74 → 75**。
+>
+> **Info10（防回归）— CRLF**：质量审查发现 CRLF 实际通过（ECMAScript `m` 标志 `$` 匹配 `\r` 前），在测试 1/2 加 CRLF 断言（二次 upsert 不重复 / remove 不留碎片），**防未来误「修」这个非 bug 反而引入回归**。
+> **延 Task 13（Informational，不改）**：① 备份名仅 `Date.now()` 无随机后缀（同毫秒碰撞，真实安装单次不触发，core mutate.js 用 `<ts>-<rand>/`）；② uninstall 对无 config 的 home 会创建空 config.toml + 备份（Info7）；③ CRLF 文件追加 LF 节产生混合行尾（合法 TOML、cosmetic，Info8）；④ marketplace 副本含 install.mjs/package.json 死重（cwd=仓库、server 从仓库跑，Info9）；⑤ **marketplace.json/plugin.json schema 仍暂定**，且 **marketplace 副本非自足（.mcp.json cwd 指向仓库、依赖仓库 node_modules）**——Task 13 真实安装为权威校验点（确认 Codex 按 cwd 从仓库启动 server、插件加载）。
+> **fixer 指引**：先提取修订后 install.test.js（5 测试）→ 跑 against **旧 install.mjs（6a4fb00）** → 确认 RED（4 判别器 fail：尾随注释 upsert/remove、mytests.js、自检）→ 再提取修订后 install.mjs → 跑 → GREEN（5 pass）→ 全套 75 → commit 仅 install.mjs + install.test.js（本计划修订已随 docs(plan) 提交）。**绝不裸跑 `node install.mjs`（会装到真实 ~/.codex）**；测试仅用临时 home。
 
 ---
 
