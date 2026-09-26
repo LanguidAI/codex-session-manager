@@ -2415,6 +2415,7 @@ git commit -m "feat(core): 统计聚合与包出口，core 完成"
 ```js
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import net from 'node:net'
 import { createApp } from '../server.mjs'
 import { backdate, makeHome, writeIndex, writeSession } from '../../core/tests/helpers/fixture.js'
 
@@ -2540,6 +2541,59 @@ test('malformed JSON body 返回 400 invalid 而非 500（前置修订 4）', as
     assert.equal((await res.json()).error.code, 'invalid')
   })
 })
+
+test('畸形请求目标不致服务崩溃（审查 I1：new URL 入 try）', async () => {
+  const home = await makeHome()
+  await withServer(home, async ({ base, raw }) => {
+    const port = Number(new URL(base).port)
+    // 裸 socket 发送畸形绝对形式请求目标：llhttp 接受，但 new URL('http://[::1') 会抛（未闭合 IPv6）
+    await new Promise((resolve) => {
+      const sock = net.connect(port, '127.0.0.1', () => {
+        sock.write('GET http://[::1 HTTP/1.1\r\nHost: x\r\n\r\n')
+      })
+      sock.on('data', () => {}) // 读取（可能是 400 响应）后丢弃
+      sock.on('close', resolve)
+      sock.on('error', resolve)
+      setTimeout(resolve, 500)
+    })
+    // 服务必须仍存活：后续正常请求 200（修复前该畸形请求会让进程崩溃 → 此处连接被拒）
+    const health = await raw('/api/health')
+    assert.equal(health.status, 200, '服务未因畸形请求目标崩溃')
+  })
+})
+
+test('null body（合法 JSON）返回 400 invalid 而非 500（审查 I2）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'n', day: '2026-05-20' })
+  await backdate(p)
+  await withServer(home, async ({ api }) => {
+    const res = await api('/api/sessions/n', { method: 'PATCH', body: 'null' })
+    assert.equal(res.status, 400)
+    assert.equal((await res.json()).error.code, 'invalid')
+  })
+})
+
+test('非法百分号编码 id 返回 400 invalid 而非 500（审查 I3）', async () => {
+  const home = await makeHome()
+  await withServer(home, async ({ api }) => {
+    const res = await api('/api/sessions/%zz')
+    assert.equal(res.status, 400)
+    assert.equal((await res.json()).error.code, 'invalid')
+  })
+})
+
+test('无标题会话 detail title=null（与 list 的 (未命名) 对齐，审查 I6）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'notitle', day: '2026-05-20' })
+  await backdate(p)
+  // 不写 index → 无标题
+  await withServer(home, async ({ api }) => {
+    const detail = await (await api('/api/sessions/notitle')).json()
+    assert.equal(detail.session.title, null, 'detail 对无标题返回 null，Task 9 统一渲染 (未命名)')
+    const list = await (await api('/api/sessions')).json()
+    assert.equal(list.sessions[0].title, '(未命名)', 'list 用 (未命名)')
+  })
+})
 ```
 
 > 注意：静态页测试要求 `packages/web/public/index.html` 已存在——本 Task 先创建最小占位 `public/index.html`（内容 `<title>CSM</title>` 即可），Task 9 再写完整前端。
@@ -2574,7 +2628,11 @@ const MAX_TITLE = 200
 
 function sendJson(res, status, data) {
   const body = JSON.stringify(data)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body) })
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store', // API 响应不缓存，防 Task 9 在 rename/archive 后读到陈旧列表（审查 I8）
+  })
   res.end(body)
 }
 
@@ -2586,12 +2644,18 @@ async function readBody(req) {
   const chunks = []
   for await (const c of req) chunks.push(c)
   if (chunks.length === 0) return {}
+  let parsed
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
   } catch {
     // 坏 JSON body → 400 invalid（否则 SyntaxError 无 .code，会落到外层 catch 成 500）
     throw new core.CsmError('invalid', 'request body must be valid JSON')
   }
+  // 合法 JSON 但为 null/数组/标量 → 400（否则 null 会在 body.title 处触发 TypeError → 500，审查 I2）
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new core.CsmError('invalid', 'request body must be a JSON object')
+  }
+  return parsed
 }
 
 /** 创建面板 HTTP 服务（不监听）。home 缺省用 CODEX_HOME；token 缺省随机生成。 */
@@ -2599,19 +2663,27 @@ export function createApp({ home, token } = {}) {
   const H = home ?? core.codexHome()
   const T = token ?? process.env.CSM_TOKEN ?? randomBytes(16).toString('hex')
 
+  /** 读取完整会话并挂载详情页字段：title（无索引标题时为 null，Task 9 统一渲染 (未命名)）、archived、mtimeMs（供乐观并发回填）。 */
   async function loadFull(id) {
     const found = await core.findSessionFile(H, id)
     if (!found) return null
     const session = await core.readSessionFile(found.path)
     const index = await core.readIndex(H)
-    session.title = index.get(id)?.title ?? session.id
+    session.title = index.get(id)?.title ?? null // 审查 I6：与 list 语义对齐；export/resume 内部仍 ?? session.id
     session.archived = found.location !== 'active'
     session.mtimeMs = found.mtimeMs
     return session
   }
 
   const server = createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://127.0.0.1')
+    // 审查 I1：new URL 必须进 try —— llhttp 接受畸形绝对形式请求目标（如 "http://[::1"），
+    // new URL 抛 TypeError 会逃逸 async handler → 未处理拒绝 → 进程崩溃（未鉴权单包 DoS）。
+    let url
+    try {
+      url = new URL(req.url, 'http://127.0.0.1')
+    } catch {
+      return sendError(res, 400, 'invalid', 'malformed request target')
+    }
     try {
       if (req.method === 'GET' && url.pathname === '/api/health') return sendJson(res, 200, { ok: true })
 
@@ -2634,7 +2706,13 @@ export function createApp({ home, token } = {}) {
         }
         const m = url.pathname.match(/^\/api\/sessions\/([^/]+)(\/export|\/resume|\/archive|\/delete)?$/)
         if (m) {
-          const id = decodeURIComponent(m[1])
+          // 审查 I3：decodeURIComponent 对非法百分号编码（%zz）抛 URIError（无 .code）→ 会成 500；显式转 400
+          let id
+          try {
+            id = decodeURIComponent(m[1])
+          } catch {
+            return sendError(res, 400, 'invalid', 'malformed session id encoding')
+          }
           const sub = m[2]
           if (req.method === 'GET' && !sub) {
             const session = await loadFull(id)
@@ -2675,8 +2753,11 @@ export function createApp({ home, token } = {}) {
         return sendError(res, 404, 'not_found', `no route ${req.method} ${url.pathname}`)
       }
 
-      // 静态文件（含路径穿越防护）
+      // 静态文件（仅 GET/HEAD；其他方法 → 404，审查 I11）
+      if (req.method !== 'GET' && req.method !== 'HEAD') return sendError(res, 404, 'not_found', 'not found')
       const p = normalize(join(PUBLIC_DIR, url.pathname === '/' ? 'index.html' : url.pathname))
+      // 纵深防御：WHATWG URL 已解析掉 dot-segments，合法 HTTP 到不了下面的 403（会落 404）；
+      // 保留是防未来重构（如改用手动解析 req.url 或先解码后 join）逃逸 PUBLIC_DIR（审查 I10）。
       if (p !== PUBLIC_DIR && !p.startsWith(PUBLIC_DIR + sep)) return sendError(res, 403, 'invalid', 'forbidden')
       let content
       try {
@@ -2689,8 +2770,15 @@ export function createApp({ home, token } = {}) {
       res.writeHead(200, { 'content-type': MIME[extname(p)] ?? 'application/octet-stream' })
       return res.end(content)
     } catch (err) {
-      const status = STATUS_BY_CODE[err?.code] ?? 500
-      return sendError(res, status, err?.code ?? 'internal', String(err?.message ?? err))
+      // 审查 I9：headers 已发出后不能再 writeHead（会抛 ERR_HTTP_HEADERS_SENT 二次崩溃）
+      if (res.headersSent) return res.end()
+      const status = STATUS_BY_CODE[err?.code]
+      // 审查 I5：仅已知 CsmError code 走映射（4xx 消息用户可读，按 I6 策略原样透出）；
+      // 未映射者（fs errno/编程错误）→ 服务端记日志，对外只给通用 internal，不泄漏绝对路径/errno。
+      // typeof number 判定同时杜绝 STATUS_BY_CODE['__proto__'] 取到 Object.prototype 真值的潜在隐患。
+      if (typeof status === 'number') return sendError(res, status, err.code, String(err?.message ?? err))
+      console.error(err)
+      return sendError(res, 500, 'internal', 'internal server error')
     }
   })
   return { server, token: T, home: H }
@@ -2699,7 +2787,8 @@ export function createApp({ home, token } = {}) {
 // 直接运行时启动面板
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const { server, token } = createApp()
-  const port = Number(process.env.CSM_PORT ?? 4173)
+  const requested = Number(process.env.CSM_PORT ?? 4173)
+  const port = Number.isFinite(requested) ? requested : 4173 // CSM_PORT 非法 → NaN 会静默用随机端口，回退默认
   server.listen(port, '127.0.0.1', () => {
     console.log(`CSM 会话面板: http://127.0.0.1:${server.address().port}/?token=${token}`)
     console.log('（仅监听 127.0.0.1；token 用于本机 API 鉴权）')
@@ -2715,7 +2804,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 **Step 4: 跑测试确认通过**
 
 Run: `node --test packages/web/tests/api.test.js`
-Expected: PASS（7 tests：health/auth、全链路、静态+穿越、活跃防护、陈旧 expectedMtimeMs、title 超长、malformed JSON）
+Expected: PASS（11 tests：health/auth、全链路、静态+穿越、活跃防护、陈旧 expectedMtimeMs、title 超长、malformed JSON、畸形请求目标不崩溃、null body→400、非法编码 id→400、无标题 detail=null）
+
+Run: `node --test 'packages/*/tests/*.test.js'`
+Expected: PASS（66 tests：core 55 + web 11）
 
 **Step 5: Commit**
 
@@ -2723,6 +2815,27 @@ Expected: PASS（7 tests：health/auth、全链路、静态+穿越、活跃防�
 git add packages/web/server.mjs packages/web/public/index.html packages/web/tests/api.test.js docs/plans/2026-09-26-codex-session-manager.md
 git commit -m "feat(web): REST API 服务（bearer 鉴权、错误映射、静态托管、穿越防护）"
 ```
+
+**Task 8 质量审查修订（2026-09-26，判定"With fixes"）：**
+
+规格审查已过（逐字节一致、7/7+62/62×3、51/51 行为探针、6 控制器修复行为级证实、真实语料只读 smoke 零变更）。质量审查证实安全基本面稳固（loopback 绑定、每次运行 128-bit token、auth-before-body 兼作 CSRF 防御、17 变体裸 socket 穿越零泄漏、expectedMtimeMs 精确往返小数 mtime、72 轮并发变更零文件系统损坏），但发现规格审查看不到的**阻断性 bug** 及一批同类/打磨项：
+
+- **I1（Important，阻断，已修）**：`new URL(req.url,…)` 原在 try 之外。llhttp 接受畸形绝对形式请求目标（如 `GET http://[::1 HTTP/1.1`），`new URL` 抛 TypeError 逃逸 async handler → 未处理拒绝 → **进程崩溃**。浏览器 fetch 会规范化故无法触发，但 loopback 跨用户——多用户机上**任一本地进程可单包打挂面板**，且违背本项目"客户端输入绝不逃逸为崩溃/500"既定策略（前置修订 a/d 同类）。修：`new URL` 入独立 try → 400 `invalid` 'malformed request target'。**判别性回归**：裸 socket 发畸形目标后，服务须存活并响应后续 health 200（修复前进程崩溃 → 连接被拒）。
+- **I2（Important，已修）**：`null` 是合法 JSON，原 readBody 不校验 → PATCH/POST 在 `body.title`/`body.force` 处对 null 取属性 → TypeError → 500 泄漏。前置修订 d 只挡了 malformed JSON，漏了 null。修：readBody 解析后校验 `parsed===null || typeof!=='object' || Array.isArray` → `CsmError('invalid')` → 400（数组也得精确 400）。回归：PATCH body `null` → 400 invalid。
+- **I3（Important，已修）**：`decodeURIComponent(m[1])` 对非法百分号编码（`%zz`/`%E0%A4%A`）抛 URIError（无 .code）→ 500。修：入 try → 400 `invalid` 'malformed session id encoding'。回归：GET `/api/sessions/%zz` → 400 invalid。
+- **I5（Minor，已修）**：外层 catch 原 `STATUS_BY_CODE[err.code] ?? 500` + `err.code ?? 'internal'` 把 **fs errno 原样当 API code**（如 `code:"EACCES"`）、message 泄漏绝对路径。修：`typeof status==='number'` 才走映射（已知 CsmError 4xx 消息按 I6 策略原样透出，用户可读）；未映射者 → `console.error` 服务端记录 + 对外只给 `code:'internal', message:'internal server error'`。`typeof number` 判定同时杜绝 `STATUS_BY_CODE['__proto__']` 取到 `Object.prototype` 真值再 `writeHead(Object.prototype)` 崩溃的潜在放大（审查 §7 演示）。
+- **I6（Minor，已修）**：detail 的 `title ?? session.id` 与 list 的 `?? '(未命名)'` 不一致（真实语料证实：同一无标题会话 list 显示 `(未命名)`、detail 返回裸 UUID，Task 9 详情标题会与所点行不符）。修：loadFull `title = index.get(id)?.title ?? null`（API 诚实：null=无标题；export/resume 内部仍 `?? session.id` 保留信息量 UUID 标题；Task 9 由单点把 null 渲染成 `(未命名)`）。回归：无 index 的会话 → detail title=null、list title='(未命名)'。
+- **I8/I9/I10/I11（Minor/nit，已修）**：I8 sendJson 加 `cache-control: no-store`（防 Task 9 在 rename/archive 后读到陈旧列表）；I9 catch 入口 `if (res.headersSent) return res.end()`（防 headers 已发后二次 writeHead 抛 ERR_HTTP_HEADERS_SENT 崩溃——当前不可达但一次未来编辑之遥）；I10 死 403 分支加注释（WHATWG URL 已解析 dot-segments，合法 HTTP 到不了，保留为防未来重构的纵深防御）；I11 静态处理限 GET/HEAD（其他方法 → 404，原 TRACE/POST 也会回 index.html）。另 CSM_PORT 非法值（NaN）回退 4173（原会静默用随机端口）。
+- **I4（Minor，延后 Task 13）**：readBody 无界缓冲（无大小上限）。审查实测 RSS 随发送线性增长，但 **token 门禁**（未鉴权 401 在 readBody 之前、不缓冲一字节）+ loopback + 单用户 → 唯一现实受害者是用户自己/Task 9 bug，属卫生非漏洞。建议 ~6 行加 10MB 上限（Content-Length 预检 + 累加计数 → 413 `too_large`），但测试笨重（fetch 的 content-length 覆盖不可靠、真发 11MB  body 太重），延后到 Task 13 遗留 Minor 包统一处理（届时同时考虑 null-proto 化 MIME/STATUS_BY_CODE，尽管 typeof-number 检查已使其 moot）。
+- **判定（不改）**：① token 非常量时间比较——loopback 绑定 + 每次运行随机 token 已足够，远程逐字节计时攻击在异步 HTTP 抖动下不成立，本地同用户进程可直接读堆/lsof，timingSafeEqual 属过度工程（若未来非 loopback 绑定再加）；② token 置于 URL（`?token=`）——这是 Task 9 前端取 token 的设计交接（app.js 读 `params.get('token')`→sessionStorage），默认 referrer 策略跨源剥离 query、页面无外部资源、无访问日志，且改用 cookie 会更糟（自动附带 → 变更端点开 CSRF，而必需的 Authorization 头正是让 drive-by 失败的原因）；③ 无分页——640 会话=261.5KB 对 loopback 传输/渲染皆轻量，但**每次 list ~0.9–1.3s**（全语料 fastMeta 扫描，服务端 q/cwd/model 过滤不减扫描成本）→ 记为 Task 9 待办（一次拉取 + 客户端过滤，字段已全在 payload）；④ 并发安全——72 轮竞争变更零损坏，无需 web 侧改动（core 两阶段设计已足够；guard 阶段 stat ENOENT→500 的理论残余竞争 72 轮未触发，记为未来 core pass）。
+
+**Task 9 待办（由 Task 8 审查记录，实施 Task 9 时必须处理）：**
+- **I7**：前端 archive/delete **必须回填 `expectedMtimeMs`**（从 detail 的 `session.mtimeMs`），否则 Task 5 的陈旧守卫在 UI 路径形同虚设——计划 Task 9 的 app.js 现写 `body:'{}'`，需改为带 expectedMtimeMs（server 侧已就绪，200/409 双向验证通过）。
+- **I6**：detail 返回的 `title` 可能为 `null`，前端在列表与详情**单点**渲染为 `(未命名)`（export/resume 内部已 `?? session.id`，无需前端处理）。
+- **延迟**：list 每次 ~1s 全语料扫描 → 前端**一次拉取 + 客户端过滤**（q/cwd/model 字段已在 payload），勿每次按键/切换都重拉；或后续加 mtime-keyed 服务端缓存。
+- **byDay 排序**（Task 7 Issue 1 已记）：看板"最近 N 天"按日期键排序切片，勿套计数排序的 `rows()`。
+
+修复提交：`git add packages/web/server.mjs packages/web/tests/api.test.js docs/plans/2026-09-26-codex-session-manager.md && git commit -m "fix(web): 质量审查修复（畸形请求目标崩溃、null body/非法编码→400、错误脱敏、title 对齐）"`（index.html 未改）。
 
 ---
 

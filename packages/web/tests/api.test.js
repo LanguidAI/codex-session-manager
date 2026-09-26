@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import net from 'node:net'
 import { createApp } from '../server.mjs'
 import { backdate, makeHome, writeIndex, writeSession } from '../../core/tests/helpers/fixture.js'
 
@@ -123,5 +124,58 @@ test('malformed JSON body 返回 400 invalid 而非 500（前置修订 4）', as
     const res = await api('/api/sessions/j', { method: 'PATCH', body: '{not json' })
     assert.equal(res.status, 400)
     assert.equal((await res.json()).error.code, 'invalid')
+  })
+})
+
+test('畸形请求目标不致服务崩溃（审查 I1：new URL 入 try）', async () => {
+  const home = await makeHome()
+  await withServer(home, async ({ base, raw }) => {
+    const port = Number(new URL(base).port)
+    // 裸 socket 发送畸形绝对形式请求目标：llhttp 接受，但 new URL('http://[::1') 会抛（未闭合 IPv6）
+    await new Promise((resolve) => {
+      const sock = net.connect(port, '127.0.0.1', () => {
+        sock.write('GET http://[::1 HTTP/1.1\r\nHost: x\r\n\r\n')
+      })
+      sock.on('data', () => {}) // 读取（可能是 400 响应）后丢弃
+      sock.on('close', resolve)
+      sock.on('error', resolve)
+      setTimeout(resolve, 500)
+    })
+    // 服务必须仍存活：后续正常请求 200（修复前该畸形请求会让进程崩溃 → 此处连接被拒）
+    const health = await raw('/api/health')
+    assert.equal(health.status, 200, '服务未因畸形请求目标崩溃')
+  })
+})
+
+test('null body（合法 JSON）返回 400 invalid 而非 500（审查 I2）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'n', day: '2026-05-20' })
+  await backdate(p)
+  await withServer(home, async ({ api }) => {
+    const res = await api('/api/sessions/n', { method: 'PATCH', body: 'null' })
+    assert.equal(res.status, 400)
+    assert.equal((await res.json()).error.code, 'invalid')
+  })
+})
+
+test('非法百分号编码 id 返回 400 invalid 而非 500（审查 I3）', async () => {
+  const home = await makeHome()
+  await withServer(home, async ({ api }) => {
+    const res = await api('/api/sessions/%zz')
+    assert.equal(res.status, 400)
+    assert.equal((await res.json()).error.code, 'invalid')
+  })
+})
+
+test('无标题会话 detail title=null（与 list 的 (未命名) 对齐，审查 I6）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'notitle', day: '2026-05-20' })
+  await backdate(p)
+  // 不写 index → 无标题
+  await withServer(home, async ({ api }) => {
+    const detail = await (await api('/api/sessions/notitle')).json()
+    assert.equal(detail.session.title, null, 'detail 对无标题返回 null，Task 9 统一渲染 (未命名)')
+    const list = await (await api('/api/sessions')).json()
+    assert.equal(list.sessions[0].title, '(未命名)', 'list 用 (未命名)')
   })
 })
