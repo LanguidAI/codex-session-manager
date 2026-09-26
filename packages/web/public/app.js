@@ -1,5 +1,5 @@
 const params = new URLSearchParams(location.search)
-const token = sessionStorage.getItem('csm-token') ?? params.get('token')
+const token = params.get('token') ?? sessionStorage.getItem('csm-token') // N1：URL 新 token 优先于 sessionStorage 旧 token（服务重启后旧标签打开新 ?token= URL 不再首屏 401）
 if (params.get('token')) sessionStorage.setItem('csm-token', params.get('token'))
 
 const $ = (sel) => document.querySelector(sel)
@@ -27,7 +27,7 @@ async function api(path, opts = {}) {
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
-const fmtTime = (iso) => (iso ? iso.replace('T', ' ').slice(0, 16) : '?')
+const fmtTime = (iso) => esc(iso ? String(iso).replace('T', ' ').slice(0, 16) : '?') // I-1：输出转义，杜绝构造 timestamp 注入 <svg onload>/<iframe srcdoc> 的存储型 XSS；String() 兼修数字 timestamp（N2）
 const fmtSize = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)}MB` : `${Math.max(1, Math.round(n / 1024))}KB`)
 
 // 一次拉全量（含归档）缓存到客户端；模型下拉从全量填一次（修复旧版从过滤结果重填、选中某模型后下拉只剩该模型的 bug）。

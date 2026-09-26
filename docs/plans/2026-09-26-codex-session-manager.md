@@ -2955,7 +2955,7 @@ main { padding: 14px 18px; }
 
 ```js
 const params = new URLSearchParams(location.search)
-const token = sessionStorage.getItem('csm-token') ?? params.get('token')
+const token = params.get('token') ?? sessionStorage.getItem('csm-token') // N1：URL 新 token 优先于 sessionStorage 旧 token（服务重启后旧标签打开新 ?token= URL 不再首屏 401）
 if (params.get('token')) sessionStorage.setItem('csm-token', params.get('token'))
 
 const $ = (sel) => document.querySelector(sel)
@@ -2983,7 +2983,7 @@ async function api(path, opts = {}) {
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
-const fmtTime = (iso) => (iso ? iso.replace('T', ' ').slice(0, 16) : '?')
+const fmtTime = (iso) => esc(iso ? String(iso).replace('T', ' ').slice(0, 16) : '?') // I-1：输出转义，杜绝构造 timestamp 注入 <svg onload>/<iframe srcdoc> 的存储型 XSS；String() 兼修数字 timestamp（N2）
 const fmtSize = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)}MB` : `${Math.max(1, Math.round(n / 1024))}KB`)
 
 // 一次拉全量（含归档）缓存到客户端；模型下拉从全量填一次（修复旧版从过滤结果重填、选中某模型后下拉只剩该模型的 bug）。
@@ -3179,6 +3179,16 @@ Run: `cd /Users/xuxianxian/Documents/test/codex-session-manager && (CODEX_HOME=$
 git add packages/web/public/ docs/plans/2026-09-26-codex-session-manager.md
 git commit -m "feat(web): 会话面板前端（列表/搜索/详情/统计/操作按钮，原生无构建；客户端过滤+expectedMtimeMs 回填+title/byDay 修正）"
 ```
+
+**Task 9 质量审查修订（2026-09-26，判定"With fixes"，1 项阻断）：**
+
+规格审查已过（3 文件逐字节一致、node --check、11/11+66/66、HTTP 服务+API 接线 60 检、过滤等价 9/9、真实语料只读探针 699 会话）。质量审查用 parse5（Node HTML 解析器，无需浏览器）+ 活体探针**推翻了规格审查对唯一 sink 的评级**，发现一个**阻断性存储型 XSS**：
+
+- **I-1（Important，阻断，已修）**：`fmtTime` 实为 `(iso) => (iso ? iso.replace('T',' ').slice(0,16) : '?')`——**零校验、输出永不转义**（规格审查误称其含 `new Date`/Invalid-Date 兜底、且断言"list 侧受 Date.parse 门保护"，**两处均被实证推翻**）。真实机制：① **detail 侧单击执行**——构造一行 JSONL，`timestamp:"<svg onload=\"1/*"` + 同会话某条消息文本 `*/;alert(1);//`，拼进 innerHTML 后 `<svg>` 的 onload 值经 parse5+`new Function` 验证**可编译执行**（innerHTML 只拦 `<script>`，不拦 `<svg onload>`；闭合引号来自下一条消息的 `class="msg…"`）；② **list 侧零点击执行/信标**——catalog 的 `Number.isFinite(Date.parse(idx.updatedAt)) && idxMs>st.mtimeMs` 门被 V8 宽松解析绕过：`'<iframe srcdoc=" 2027-01-01'`、`'<img src=//evil> 2027-01-01'` 均算**有限未来日期**而通过门，list 渲染出 `<iframe srcdoc="`（16 字符）打开引号属性吞掉后续标记，属性值内字符引用会解码 → 被 esc 的 model 字段 `&lt;script&gt;…` 在 srcdoc 内还原成活 `<script>`（无 sandbox 的 srcdoc iframe 在面板源内执行）；`<img src=//evil>` 则是零点击网络信标。**影响**：脚本运行在面板源（`sessionStorage['csm-token']` 所在）→ 持 token 全量 API 访问 → 可外泄整个会话语料（源码、粘贴的密钥）/批量删除归档；触发只需**一个共享/下载/恢复来的构造 rollout 文件**。本项目处处以敌对语料设防（stats null-proto、错误脱敏、`COPYFILE_EXCL` 备份、header 注入剥离），唯独此 sink 未转义是**阻断性不一致**。修：`fmtTime` 内部 `esc(...)` 包裹（**必须在 fmtTime 内、非调用点**——list 侧也经此 sink，且未来调用点自动继承安全）；`String(iso)` 转型同时修 **N2**（数字 timestamp 触发 `iso.replace is not a function` 致整个详情面板崩）。正常 ISO 日期经 esc 后逐字节不变（零视觉回归）。**parse5 复验**：三类 payload 经修复后均渲染为惰性 `&lt;…` 文本。
+- **N1（Minor，已修，随修复提交）**：token 优先级 bug——原 `sessionStorage.getItem('csm-token') ?? params.get('token')` 让**陈旧**存储 token 压过**新鲜** URL token（服务重启换 token 后，旧标签打开新 `?token=` URL 首屏全 401 且无指引，需手动刷新才自愈）。修：`params.get('token') ?? sessionStorage.getItem('csm-token')`（URL 优先）。
+- **延后 Task 13（非阻断，质量审查判定）**：obs#2 `download()` 的 `revokeObjectURL` 时序（Chromium 安全、FF/Safari 历史有取消风险 → 改 `appendChild`+`setTimeout(revoke,0)`）；obs#3 `selectSession` 无在途守卫（快速点击竞态，I7 的 expectedMtimeMs 已把 archive/delete 危险路径转成安全 409，残余仅 rename 错标题、极低概率 → 加 3 行序号令牌 `detailSeq`）；N3 详情拉取失败时 selected/高亮已前移而面板仍旧（rename 会指向新 id 读旧面板 → catch 里回滚）；N4 变更成功后 refresh 失败弹误导性"失败"toast；N5 死状态字段 `state.sessions`/`state.view`（写而不读，loadList→renderList 重构遗留）；N6 `download()` 丢弃服务端错误体（只报 `HTTP 500`）；N7 无加载态（首屏 ~1s、详情 ~1.26s 期间空白；过滤重渲染滚动复位）；N8 a11y（toast 无 aria-live、输入仅 placeholder 标注、无 :focus-visible）；N9 每次切统计页全语料重扫（本地可接受）；N10 clipboard 依赖安全上下文（127.0.0.1 满足，可加 textarea 兜底）；**I-2（core 侧纵深防御）**——catalog 的 `Date.parse` 门收紧为 ISO 形状校验 + reader 的 `createdAt`(L62)/`timestamp`(L70) 补 `typeof==='string'` 守卫（客户端 fmtTime 修复已完全中和面板渲染，core 收紧是为 export/resume 等其它消费者的纵深防御；export/resume 是人类可读产物，按计划 L2166 先例可接受原始 timestamp）。
+
+修复提交：`git add packages/web/public/app.js docs/plans/2026-09-26-codex-session-manager.md && git commit -m "fix(web): 质量审查修复（fmtTime 输出转义堵存储型 XSS、token 优先级）"`（仅 app.js 两行 + 计划文档；index.html/style.css 未改）。修复后须复验：node --check、66/66、parse5 确认 payload 惰性、逐字节一致。
 
 ---
 
