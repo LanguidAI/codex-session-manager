@@ -1,0 +1,12 @@
+{
+  "name": "codex-session-manager",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/core", "packages/web", "packages/plugin"],
+  "scripts": {
+    "test": "node --test packages/core/tests packages/web/tests packages/plugin/tests",
+    "web": "node packages/web/server.mjs",
+    "install:plugin": "node packages/plugin/install.mjs",
+    "uninstall:plugin": "node packages/plugin/install.mjs --uninstall"
+  }
+}
