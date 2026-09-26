@@ -4040,20 +4040,27 @@ Expected: 能看到两个新节；`ls ~/.codex/config.toml.bak-csm-*` 有备份�
 - [ ] 对话里重命名一个测试会话 → Web 面板刷新可见新标题
 - [ ] Web 面板上对一个**测试**会话执行归档、删除 → 文件分别出现在 `~/.codex/archived_sessions/` 与 `~/.codex/.csm-trash/`，且 `.csm-backups/` 有备份
 
-**Step 5: 最终提交并推送**
+**Step 5: 最终提交（推送交 finishing-a-development-branch）**
 
 ```bash
-git add -A
-git commit -m "docs: 完善 README；CSM v0.1.0 完成"
-git push
+git add README.md
+git commit -m "docs: 完善 README；CSM v0.1.0 实现完成"
 ```
-Expected: 推送到 `LanguidAI/codex-session-manager`（走 ssh.github.com:443，勿改 HTTPS）
+Expected: README 提交到 feature 分支 `feature/session-manager-v0.1`。**本任务不 `git push`**：feature 分支尚无 upstream（裸 `git push` 会 fatal），且按纪律推送留到 `finishing-a-development-branch` 阶段统一决定整合方式（合并到 main / PR / 推送），远端走 `ssh://git@ssh.github.com:443/LanguidAI/codex-session-manager.git`（勿改 HTTPS）。
+
+> **Task 13 预审修订（2026-09-27，控制器对真实代码核实后修订，供执行/finishing 参照）**
+> **① 陈旧测试数已修**：原验收标准 1「core 22+ / web 4 / plugin 7」为早期估计；实测 **core 55 / web 11 / plugin 9（plugin = tools 4 + install 5），合计 75**（`node --test 'packages/*/tests/*.test.js'` → 75 pass / 0 fail）。下方已改。
+> **② README 事实核实（Step 2 块内容逐项核对准确，无需改）**：端口 4173（[server.mjs:182-183](packages/web/server.mjs#L182) `CSM_PORT` 可覆盖，:185 打印 `http://127.0.0.1:<port>/?token=<token>`）✓；30s 活跃窗（[mutate.js:10](packages/core/src/mutate.js#L10) `ACTIVE_WINDOW_MS=30_000`，:62 `!force && age<窗` 拒绝、force 越过）✓；目录 `.csm-backups`/`.csm-trash`/`archived_sessions`（[paths.js:20-22](packages/core/src/paths.js#L20)）✓；6 MCP 工具 list/get/rename/archive/delete/export_session（[server.mjs:25-75](packages/plugin/server.mjs#L25)）✓；npm scripts test/web/install:plugin/uninstall:plugin 均在根 package.json ✓；127.0.0.1 + 随机 bearer token（[server.mjs:56,84,184](packages/web/server.mjs#L56)）✓。
+> **③ Step 5 推送调和**：原 `git push` 与「feature 分支不推送直到 finishing-a-development-branch」纪律冲突，且分支无 upstream（裸 push 会 fatal）。改为 Task 13 仅提交 README；推送/合并/PR 全交 `finishing-a-development-branch`。
+> **④ 真实安装（Step 3）= 首次真跑、provisional 清单权威校验点**：`npm run install:plugin`（相对路径 → CLI 守卫触发，[install.mjs:150](packages/plugin/install.mjs#L150)）作用于真实 `~/.codex`——**additive + 自动备份**（config.toml.bak-csm-*）、可逆（uninstall:plugin）、不碰 sessions/rollouts。这是 plugin.json/.mcp.json/marketplace.json schema（字段确认真实、清单结构暂定）+ marketplace 副本方案（.mcp.json cwd=仓库、server 从仓库解析 @csm/core+sdk）的**权威验证**。**Step 4 验收（重启 Codex Desktop、插件加载、6 工具可用、写操作 approval、真实会话浏览）需人工——agent 无法重启/交互 Desktop，是 user-gated 步骤。**
+> **⑤ 信息性（web 守卫，不改）**：[server.mjs:180](packages/web/server.mjs#L180) is-main 守卫用 `import.meta.url===pathToFileURL(process.argv[1]).href`，与 Task 12 M3 同类 symlink 局限（argv[1] 未 realpath）；但 `npm run web`（相对路径）Node 解析 argv[1] 为真实绝对路径 → 守卫正确触发，symlink 边例非真实路径（预先存在、Task 7 已审，仅记录）。
+> **⑥ 延期 bundle 处置**：Task 12 复审 Deferred-M1（自检拼写盲区）/Deferred-M2（uninstall parity）+ 前序任务延期项（T8 I4 body cap 413、T9 N3-N10+core hardening、T10 M-5/M-6、T11 Minor1/2+Info3-6、T12 Info6-9、scaffold 项）均 Minor/Informational、非阻塞、**不在 Task 13 必修**；finishing-a-development-branch 时统一评估为 v0.2 backlog 或随后续修复（真实安装+验收通过即 v0.1 达标）。
 
 ---
 
 ## 验收标准（整体）
 
-1. `npm test` 全绿（core 22+ / web 4 / plugin 7）
+1. `npm test` 全绿（core 55 / web 11 / plugin 9，合计 75）
 2. Web 面板对真实 `~/.codex` 只读浏览正常；写操作只在用户确认的测试会话上验证
 3. Codex Desktop 中插件可启用，6 个工具全部可用，写操作触发 approval prompt
 4. 任何写操作后 `~/.codex/.csm-backups/` 都能找到对应备份；无文件被物理删除
