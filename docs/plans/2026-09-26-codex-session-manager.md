@@ -2173,19 +2173,30 @@ git commit -m "fix(core): 导出质量审查修复（JSON 字段白名单、代�
 - Create: `packages/core/src/stats.js`、`packages/core/src/index.js`
 - Test: `packages/core/tests/stats.test.js`
 
+**前置修订（2026-09-26，控制器预审）：**
+
+1. **stats 测试的 mtime 覆盖 bug**（与 Task 4 排序测试同类）：原测试不 backdate 会话文件，`writeSession` 写的文件 mtime=now（2026-09-26），而 listSessions 的 `updatedAt = max(索引时间, mtime)`（Task 4 修订）会让 mtime 覆盖索引里 5 月的日期 → `byDay` 全部落在今天 → `byDay['2026-05-20']===2` 断言必失败。修正：三个会话各自 `backdate` 到目标日期（mtime ≈ 索引时间，日期桶正确）。
+2. **recent7 数值化**：原 `(s.updatedAt ?? '') >= weekAgo` 字符串比较 ISO 时间，混合小数精度（索引 4/5/6 位 vs mtime 3 位）在边界可能误判——沿用 Task 4 I2 教训改为 `Date.parse(...) >= weekAgoMs` 数值比较。
+3. **补 recent7 测试**：原测试完全不覆盖 recent7；新增第 2 用例（一个 mtime=now 命中、一个 backdate 到远期不命中）。
+4. **Step 4 计数陈旧**：原写 25 tests，实际 core 全套为 paths 6 + reader 11 + catalog 9 + mutate 14 + export 8 + stats 2 = **50**。
+
 **Step 1: 写失败测试** `packages/core/tests/stats.test.js`
 
 ```js
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildStats } from '../src/stats.js'
-import { makeHome, writeIndex, writeSession } from './helpers/fixture.js'
+import { backdate, makeHome, writeIndex, writeSession } from './helpers/fixture.js'
 
 test('buildStats: 按天/项目/模型/供应商聚合', async () => {
   const home = await makeHome()
-  await writeSession(home, { id: 'a', day: '2026-05-20', cwd: '/p1', model: 'gpt-5.5' })
-  await writeSession(home, { id: 'b', day: '2026-05-20', cwd: '/p1', model: 'gpt-5.6' })
-  await writeSession(home, { id: 'c', day: '2026-05-21', cwd: '/p2', model: 'gpt-5.5' })
+  const pa = await writeSession(home, { id: 'a', day: '2026-05-20', cwd: '/p1', model: 'gpt-5.5' })
+  const pb = await writeSession(home, { id: 'b', day: '2026-05-20', cwd: '/p1', model: 'gpt-5.6' })
+  const pc = await writeSession(home, { id: 'c', day: '2026-05-21', cwd: '/p2', model: 'gpt-5.5' })
+  // 关键：backdate 到目标日期，否则 mtime=now 会经 max() 覆盖索引时间，byDay 落到今天（前置修订 1）
+  await backdate(pa, Date.now() - Date.parse('2026-05-20T12:00:00Z'))
+  await backdate(pb, Date.now() - Date.parse('2026-05-20T13:00:00Z'))
+  await backdate(pc, Date.now() - Date.parse('2026-05-21T13:00:00Z'))
   await writeIndex(home, [
     { id: 'a', thread_name: 'A', updated_at: '2026-05-20T12:00:00Z' },
     { id: 'b', thread_name: 'B', updated_at: '2026-05-20T13:00:00Z' },
@@ -2199,6 +2210,16 @@ test('buildStats: 按天/项目/模型/供应商聚合', async () => {
   assert.equal(s.byProject['/p1'], 2)
   assert.equal(s.byModel['gpt-5.5'], 2)
   assert.equal(s.byProvider['azure'], 3)
+})
+
+test('buildStats: recent7 只计近 7 天更新的会话（前置修订 3）', async () => {
+  const home = await makeHome()
+  await writeSession(home, { id: 'r', day: '2026-05-20' }) // mtime = now → 近 7 天内
+  const pOld = await writeSession(home, { id: 'o', day: '2026-05-20' })
+  await backdate(pOld, Date.now() - Date.parse('2026-05-20T12:00:00Z')) // 远期
+  const s = await buildStats({ home })
+  assert.equal(s.total, 2)
+  assert.equal(s.recent7, 1, '仅未 backdate 者（mtime=now）在近 7 天内')
 })
 ```
 
@@ -2230,11 +2251,12 @@ export async function buildStats({ home }) {
     bump(byModel, s.model)
     bump(byProvider, s.provider)
   }
-  const weekAgo = new Date(Date.now() - 7 * 86_400_000).toISOString()
+  const weekAgoMs = Date.now() - 7 * 86_400_000
   return {
     total: active.length,
     archived: all.length - active.length,
-    recent7: active.filter((s) => (s.updatedAt ?? '') >= weekAgo).length,
+    // recent7 用数值时间戳比较（沿用 Task 4 I2 教训：ISO 混合小数精度下字符串比较会在边界误判）
+    recent7: active.filter((s) => Date.parse(s.updatedAt ?? '') >= weekAgoMs).length,
     byDay,
     byProject,
     byModel,
@@ -2257,15 +2279,15 @@ export * from './stats.js'
 **Step 4: 跑 core 全部测试确认通过**
 
 Run: `node --test "packages/core/tests/*.test.js"`（Node 25 不接受裸目录参数）
-Expected: PASS（25 tests：paths 6 + reader 3 + catalog 6 + mutate 6 + export 3 + stats 1，允许总数略有出入但必须全绿）
+Expected: PASS（50 tests：paths 6 + reader 11 + catalog 9 + mutate 14 + export 8 + stats 2）
 
 Run: `node -e "import('@csm/core').then(m => console.log(Object.keys(m).length + ' exports'))"`
-Expected: 输出 exports 数量 ≥ 15（验证 workspace 链接与汇总出口）
+Expected: 输出 exports 数量 ≥ 15（实际应约 19：CsmError + codexHome/layout/anchor + parseSessionContent/readSessionFile/fastMeta + readIndex/listSessions/findSessionFile/findSessionFiles + renameSession/archiveSession/deleteSession + toMarkdown/toJson/buildResumeContext/renderExport + buildStats；验证 workspace 链接与汇总出口）
 
 **Step 5: Commit**
 
 ```bash
-git add packages/core/src/stats.js packages/core/src/index.js packages/core/tests/stats.test.js
+git add packages/core/src/stats.js packages/core/src/index.js packages/core/tests/stats.test.js docs/plans/2026-09-26-codex-session-manager.md
 git commit -m "feat(core): 统计聚合与包出口，core 完成"
 ```
 
