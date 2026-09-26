@@ -1937,7 +1937,7 @@ Expected: PASS（40 tests：paths 6 + reader 11 + catalog 9 + mutate 14）
 - **I4**：`moveSession` 改两阶段（先全部防护后全部移动）——把审查实证涌现的"可预期失败先于任何写盘"原子性变成结构性保证；移动中 ENOENT（外部并发删除）包装为 `conflict`（可重试完成），不再泄漏原始 fs 错误（→ 500）。
 - **I5**：三个入口对非字符串/空 `id` 抛 `invalid`（web 层可正确映射 400 而非 404）。
 - **I7（采纳部分）**：备份 `copyFile` 加 `COPYFILE_EXCL`；导出函数补 `@returns` JSDoc。
-- **I6（决策，Task 8/10 遵循）**：错误消息语言策略——面向用户可操作的防护消息（active/ vanished-retry）用中文，结构性错误（not_found/invalid/conflict 细节）用英文；web 前端可按 code 本地化展示，不依赖 message 原文。标题长度上限由 web/MCP 入口层约束（core 不设限）。
+- **I6（决策，Task 8/10 遵循）**：错误消息语言策略——面向用户可操作的防护消息（active）用中文；结构性错误（not_found/invalid/conflict，含移动中 ENOENT 的 vanished-retry 消息）用英文；web 前端可按 code 本地化展示，不依赖 message 原文。标题长度上限由 web/MCP 入口层约束（core 不设限）。
 - 新增测试 5 个（备份字节完整性、冲突正向路径、跨 location 清扫、无尾换行索引、expectedMtimeMs 类型语义），mutate 共 14 tests。
 
 **Step 5: Commit**
