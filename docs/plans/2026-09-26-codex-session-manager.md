@@ -1604,11 +1604,12 @@ test('rename: 追加索引行，catalog 反映新标题，索引先备份', asyn
   assert.ok(backupFiles.includes('session_index.jsonl'))
 })
 
-test('rename: 未知 id → not_found；空标题 → invalid', async () => {
+test('rename: 未知 id → not_found；空标题 / 非字符串 id → invalid', async () => {
   const home = await makeHome()
   await writeSession(home, { id: 'a', day: '2026-05-20' })
   await assert.rejects(() => renameSession({ home, id: 'nope', title: 'x' }), (e) => e.code === 'not_found')
   await assert.rejects(() => renameSession({ home, id: 'a', title: '   ' }), (e) => e.code === 'invalid')
+  await assert.rejects(() => renameSession({ home, id: 123, title: 'x' }), (e) => e.code === 'invalid', '非字符串 id → invalid（审查 I5）')
 })
 
 test('archive: 移入 archived_sessions，活跃列表消失，归档列表出现', async () => {
@@ -1691,6 +1692,70 @@ test('活跃防护: 同一毫秒写入的文件也必须拒绝（审查修正：
   await writeSession(home, { id: 'now', day: '2026-05-20' }) // mtime ≈ now，可能与 Date.now() 同毫秒
   await assert.rejects(() => archiveSession({ home, id: 'now' }), (e) => e.code === 'active')
 })
+
+test('备份完整性: 软删除后备份与 trash 内文件字节均与原文件一致（审查测试缺口 1）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await backdate(p)
+  const original = await readFile(p)
+  const r = await deleteSession({ home, id: 'a' })
+  const backups = await readdir(layout(home).backupsDir)
+  assert.equal(backups.length, 1)
+  const backupFiles = await readdir(join(layout(home).backupsDir, backups[0]))
+  const bf = backupFiles.find((f) => f.includes('rollout-'))
+  assert.ok(bf, '备份目录内有 rollout 文件')
+  assert.deepEqual(await readFile(join(layout(home).backupsDir, backups[0], bf)), original, '备份字节与原文件一致')
+  assert.deepEqual(await readFile(r.path), original, 'trash 内文件字节与原文件一致')
+})
+
+test('冲突防护: expectedMtimeMs 相符 → 正常归档（审查测试缺口 2，正向路径）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await backdate(p)
+  const st = await stat(p)
+  const r = await archiveSession({ home, id: 'a', expectedMtimeMs: st.mtimeMs })
+  assert.equal(r.location, 'archived')
+})
+
+test('delete: 跨 location 分片一并扫入 trash（审查 I1）', async () => {
+  const home = await makeHome()
+  const p1 = await writeSession(home, { id: 'm1', day: '2026-05-20', fork: 'orig' })
+  await backdate(p1)
+  await archiveSession({ home, id: 'm1' })
+  // 模拟部分移动残留 / Desktop 侧又写：active 出现同 id 新分片
+  const p2 = await writeSession(home, { id: 'm1', day: '2026-05-21', fork: 'new' })
+  await backdate(p2)
+  const r = await deleteSession({ home, id: 'm1' })
+  assert.equal(r.location, 'trash')
+  assert.equal((await listSessions({ home, includeArchived: true })).length, 0, 'active/archived 都不再残留分片')
+  const names = await readdir(layout(home).trashDir)
+  assert.equal(names.length, 2, '两个分片都进了 trash')
+  assert.equal((await findSessionFile(home, 'm1')).location, 'trash')
+})
+
+test('rename: 索引末行无换行符也不粘连（审查 I2）', async () => {
+  const home = await makeHome()
+  await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await writeFile(layout(home).index, '{"id":"old","thread_name":"旧","updated_at":"2026-05-20T00:00:00Z"}') // 无尾换行
+  await renameSession({ home, id: 'a', title: '新标题' })
+  const idx = await readIndex(home)
+  assert.equal(idx.get('a').title, '新标题', '新行独立可解析')
+  assert.equal(idx.get('old').title, '旧', '原条目未被粘连吞掉')
+})
+
+test('冲突防护: expectedMtimeMs null 视为未提供、数值字符串被强转、垃圾值 → invalid（审查 I3）', async () => {
+  const home = await makeHome()
+  const pa = await writeSession(home, { id: 'sa', day: '2026-05-20' })
+  await backdate(pa)
+  assert.equal((await archiveSession({ home, id: 'sa', expectedMtimeMs: null })).location, 'archived', 'null → 视为未提供')
+  const pb = await writeSession(home, { id: 'sb', day: '2026-05-20' })
+  await backdate(pb)
+  const stb = await stat(pb)
+  assert.equal((await archiveSession({ home, id: 'sb', expectedMtimeMs: String(stb.mtimeMs) })).location, 'archived', '数值字符串被强转后相符')
+  const pc = await writeSession(home, { id: 'sc', day: '2026-05-20' })
+  await backdate(pc)
+  await assert.rejects(() => archiveSession({ home, id: 'sc', expectedMtimeMs: 'abc' }), (e) => e.code === 'invalid', '非数值 → invalid')
+})
 ```
 
 **Step 2: 跑测试确认失败**
@@ -1702,7 +1767,8 @@ Expected: FAIL，`Cannot find module '.../src/mutate.js'`
 
 ```js
 import { randomBytes } from 'node:crypto'
-import { appendFile, copyFile, mkdir, rename as fsRename, stat } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { appendFile, copyFile, mkdir, readFile, rename as fsRename, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { findSessionFiles } from './catalog.js'
 import { CsmError } from './errors.js'
@@ -1716,12 +1782,15 @@ function backupDirName() {
   return `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomBytes(2).toString('hex')}`
 }
 
-/** 把文件备份到 .csm-backups/<时间戳-随机>/ 下，返回备份路径。 */
+/**
+ * 把文件备份到 .csm-backups/<时间戳-随机>/ 下，返回备份路径。
+ * COPYFILE_EXCL：备份目标已存在时拒绝覆盖——宁可响亮失败也不静默覆盖（审查 I7）。
+ */
 async function backupFile(home, filePath) {
   const dir = join(layout(home).backupsDir, backupDirName())
   await mkdir(dir, { recursive: true })
   const dest = join(dir, basename(filePath))
-  await copyFile(filePath, dest)
+  await copyFile(filePath, dest, constants.COPYFILE_EXCL)
   return dest
 }
 
@@ -1745,8 +1814,15 @@ async function uniqueDest(dir, filePath) {
 /** 移动前防护：mtime 与读取时不符 → conflict；30s 内活跃写入 → active（force 越过）。 */
 async function guardMovable(filePath, { force, expectedMtimeMs } = {}) {
   const st = await stat(filePath)
-  if (expectedMtimeMs !== undefined && st.mtimeMs !== expectedMtimeMs) {
-    throw new CsmError('conflict', `session file changed since read (expected mtime ${expectedMtimeMs}, got ${st.mtimeMs})`)
+  // 审查 I3：null/undefined 视为未提供；数值字符串强转；其余非数值 → invalid（避免 "expected X, got X" 式不可诊断假冲突）
+  if (expectedMtimeMs != null) {
+    const expected = Number(expectedMtimeMs)
+    if (!Number.isFinite(expected)) {
+      throw new CsmError('invalid', `expectedMtimeMs must be a finite number, got ${JSON.stringify(expectedMtimeMs)}`)
+    }
+    if (st.mtimeMs !== expected) {
+      throw new CsmError('conflict', `session file changed since read (expected mtime ${expected}, got ${st.mtimeMs})`)
+    }
   }
   // 审查修正：APFS mtime 带小数精度而 Date.now() 截断到整毫秒，同一毫秒内写入的文件 age 为微小负值；
   // 原 `age >= 0` 条件会放行最危险的“正在写入”场景。夹紧到 0：宁可误拒（force 可越过）不可漏放。
@@ -1757,38 +1833,55 @@ async function guardMovable(filePath, { force, expectedMtimeMs } = {}) {
   return st
 }
 
-/** 重命名：向 session_index.jsonl 追加新行（后行生效语义），追加前备份索引。 */
+/**
+ * 重命名：向 session_index.jsonl 追加新行（后行生效语义），追加前备份索引。
+ * 审查 I2：索引末行缺换行符（写入中断产物）时先补 \n 再追加，避免粘连吞掉条目。
+ * @returns {Promise<{id: string, title: string}>}
+ */
 export async function renameSession({ home, id, title }) {
+  if (typeof id !== 'string' || id === '') throw new CsmError('invalid', 'id must be a non-empty string')
   const t = typeof title === 'string' ? title.trim() : ''
   if (!t) throw new CsmError('invalid', 'title is required')
   const matches = await findSessionFiles(home, id)
   if (matches.length === 0) throw new CsmError('not_found', `session ${id} not found`)
   const l = layout(home)
+  let needsNewline = false
   try {
-    await stat(l.index)
+    const existing = await readFile(l.index)
+    needsNewline = existing.length > 0 && existing[existing.length - 1] !== 0x0a
     await backupFile(home, l.index)
   } catch (e) {
     if (e.code !== 'ENOENT') throw e
   }
-  await appendFile(l.index, JSON.stringify({ id, thread_name: t, updated_at: new Date().toISOString() }) + '\n')
+  await appendFile(l.index, (needsNewline ? '\n' : '') + JSON.stringify({ id, thread_name: t, updated_at: new Date().toISOString() }) + '\n')
   return { id, title: t }
 }
 
-/** 归档：把会话的全部分片文件移入官方 archived_sessions/（与 Desktop 行为一致），逐个先备份。 */
+/**
+ * 归档：把会话 active 组的全部分片文件移入官方 archived_sessions/（与 Desktop 行为一致），逐个先备份。
+ * @returns {Promise<{id: string, location: 'archived', path: string}>}
+ */
 export async function archiveSession({ home, id, force, expectedMtimeMs }) {
   return moveSession({ home, id, force, expectedMtimeMs, to: 'archived' })
 }
 
-/** 删除：软删除，把会话的全部分片文件移入 .csm-trash/（绝不物理删除），逐个先备份。 */
+/**
+ * 删除：软删除，把会话的全部分片文件扫入 .csm-trash/（绝不物理删除），逐个先备份。
+ * 审查 I1：跨 active/archived 一并扫走，保证“delete ⇒ 列表消失”契约成立。
+ * @returns {Promise<{id: string, location: 'trash', path: string}>}
+ */
 export async function deleteSession({ home, id, force, expectedMtimeMs }) {
   return moveSession({ home, id, force, expectedMtimeMs, to: 'trash' })
 }
 
 /**
- * 共享移动逻辑：定位全部匹配 → location 校验 → 逐文件防护/备份/防碰撞移动。
- * expectedMtimeMs 只约束主文件（UI/工具读到的那个），其余分片只做活跃防护（前置修订 1）。
+ * 共享移动逻辑：定位全部匹配 → location 校验 → 两阶段执行（审查 I4）：
+ * 先逐文件防护（conflict/active）——可预期失败全部发生在任何写盘之前；
+ * 再逐文件备份/防碰撞移动。expectedMtimeMs 只约束主文件（UI/工具读到的那个）。
+ * 移动中被外部并发删除（ENOENT）→ conflict（重试可完成剩余分片）。
  */
 async function moveSession({ home, id, force, expectedMtimeMs, to }) {
+  if (typeof id !== 'string' || id === '') throw new CsmError('invalid', 'id must be a non-empty string')
   const l = layout(home)
   const matches = await findSessionFiles(home, id)
   if (matches.length === 0) throw new CsmError('not_found', `session ${id} not found`)
@@ -1799,17 +1892,29 @@ async function moveSession({ home, id, force, expectedMtimeMs, to }) {
   if (to === 'trash' && primary.location === 'trash') {
     throw new CsmError('invalid', 'session is already in trash')
   }
-  const group = matches.filter((m) => m.location === primary.location)
+  // archive 只移动主 location 组；delete 扫走全部尚未入 trash 的分片（审查 I1）
+  const group = to === 'trash'
+    ? matches.filter((m) => m.location !== 'trash')
+    : matches.filter((m) => m.location === primary.location)
   const destDir = to === 'archived' ? l.archivedDir : l.trashDir
   await mkdir(destDir, { recursive: true })
-  let dest = null
   for (const m of group) {
     const isPrimary = m.path === primary.path
     await guardMovable(m.path, { force, expectedMtimeMs: isPrimary ? expectedMtimeMs : undefined })
-    await backupFile(home, m.path)
+  }
+  let dest = null
+  for (const m of group) {
     const d = await uniqueDest(destDir, m.path)
-    await fsRename(m.path, d)
-    if (isPrimary) dest = d
+    try {
+      await backupFile(home, m.path)
+      await fsRename(m.path, d)
+    } catch (e) {
+      if (e?.code === 'ENOENT') {
+        throw new CsmError('conflict', `session file vanished during operation, retry to finish: ${m.path}`)
+      }
+      throw e
+    }
+    if (m.path === primary.path) dest = d
   }
   return { id, location: to, path: dest }
 }
@@ -1818,12 +1923,22 @@ async function moveSession({ home, id, force, expectedMtimeMs, to }) {
 **Step 4: 跑测试确认通过**
 
 Run: `node --test packages/core/tests/mutate.test.js`
-Expected: PASS（9 tests；连跑 5 次无不稳定——审查修正后活跃防护测试不再依赖同毫秒竞态）
+Expected: PASS（14 tests；连跑 5 次无不稳定——审查修正后活跃防护测试不再依赖同毫秒竞态）
 
 Run: `node --test "packages/core/tests/*.test.js"`
-Expected: PASS（35 tests：paths 6 + reader 11 + catalog 9 + mutate 9）
+Expected: PASS（40 tests：paths 6 + reader 11 + catalog 9 + mutate 14）
 
 **审查修正（2026-09-26，规格审查实证）**：原 `guardMovable` 的 `age >= 0` 条件存在同毫秒旁路——APFS mtime 带小数、`Date.now()` 截断整毫秒，刚写入的文件 age 为微小负值被直接放行（实测 190/200 新文件负 age；独立运行 mutate 测试约 4/10 概率失败，全量套件因并行负载拉长写-读间隔而掩盖）。修正：age 夹紧为 `Math.max(0, …)`（宁可误拒，force 可越过）；「活跃防护」测试改用固定 5 秒偏移去竞态；新增同毫秒回归测试（第 9 用例）。上文 Step 1/Step 3 代码块已同步修订。
+
+**质量审查修订（2026-09-26）**：质量审查对抗探查确认无字节丢失路径后，门控以下修复（上文 Step 1/Step 3 代码块已同步修订）：
+- **I1**：`deleteSession` 跨 location 扫走全部非 trash 分片（原实现只移主 location 组，混合状态下返回 `{location:'trash'}` 但会话仍在列表——契约说谎）；`archiveSession` 保持只移 active 组。
+- **I2**：`renameSession` 追加前检查索引末字节，缺 `\n` 先补（防止粘连吞掉既有条目且静默 no-op）。
+- **I3**：`expectedMtimeMs` `!= null` 判定 + `Number()` 强转 + 非有限数 → `invalid`（原严格 `!==` 使 JSON body 的 `null`、数值字符串产生 "expected X, got X" 式假冲突）。
+- **I4**：`moveSession` 改两阶段（先全部防护后全部移动）——把审查实证涌现的"可预期失败先于任何写盘"原子性变成结构性保证；移动中 ENOENT（外部并发删除）包装为 `conflict`（可重试完成），不再泄漏原始 fs 错误（→ 500）。
+- **I5**：三个入口对非字符串/空 `id` 抛 `invalid`（web 层可正确映射 400 而非 404）。
+- **I7（采纳部分）**：备份 `copyFile` 加 `COPYFILE_EXCL`；导出函数补 `@returns` JSDoc。
+- **I6（决策，Task 8/10 遵循）**：错误消息语言策略——面向用户可操作的防护消息（active/ vanished-retry）用中文，结构性错误（not_found/invalid/conflict 细节）用英文；web 前端可按 code 本地化展示，不依赖 message 原文。标题长度上限由 web/MCP 入口层约束（core 不设限）。
+- 新增测试 5 个（备份字节完整性、冲突正向路径、跨 location 清扫、无尾换行索引、expectedMtimeMs 类型语义），mutate 共 14 tests。
 
 **Step 5: Commit**
 
