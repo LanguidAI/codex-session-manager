@@ -3217,7 +3217,7 @@ git commit -m "feat(web): 会话面板前端（列表/搜索/详情/统计/操�
 ```js
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createSessionTools } from '../src/tools.js'
 import { backdate, makeHome, writeIndex, writeSession } from '../../core/tests/helpers/fixture.js'
@@ -3260,6 +3260,29 @@ test('export_session: 默认 CODEX_HOME/exports；outputPath 锚定在 CODEX_HOM
   const r2 = await tools.export_session({ id: 'a', outputPath: 'rel.md' })
   assert.equal(r2.path, join(home, 'rel.md'), '相对路径解析进 CODEX_HOME')
   await assert.rejects(() => tools.export_session({ id: 'a', outputPath: '/etc/evil.md' }), (e) => e.code === 'invalid')
+  // I-3：export_session 的工具专属组合属性——json 默认命名 + 非法 format 在任何 fs 写入前抛 invalid（零副作用）
+  const rj = await tools.export_session({ id: 'a', format: 'json' })
+  assert.equal(rj.path, join(home, 'exports', 'a.json'))
+  assert.equal(JSON.parse(await readFile(rj.path, 'utf8')).id, 'a')
+  await assert.rejects(() => tools.export_session({ id: 'a', format: '../../evil' }), (e) => e.code === 'invalid')
+  assert.deepEqual((await readdir(home)).sort(), ['exports', 'rel.md', 'sessions'], '非法 format ⇒ 零 fs 副作用')
+})
+
+test('安全护栏：export 拒绝覆盖 exports/ 外文件、rename 标题封顶', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await backdate(p)
+  const tools = createSessionTools({ home })
+  // I-1：outputPath 指向 exports/ 外的既有文件 → conflict 且原文件完好（皇冠明珠防护，全产品唯一不可逆写）
+  await writeFile(join(home, 'precious.txt'), 'ORIGINAL')
+  await assert.rejects(() => tools.export_session({ id: 'a', outputPath: 'precious.txt' }), (e) => e.code === 'conflict')
+  assert.equal(await readFile(join(home, 'precious.txt'), 'utf8'), 'ORIGINAL')
+  // exports/ 内同名文件允许幂等重导（不 conflict）
+  const e1 = await tools.export_session({ id: 'a', format: 'md' })
+  const e2 = await tools.export_session({ id: 'a', format: 'md' })
+  assert.equal(e1.path, e2.path)
+  // I-2：rename 标题超过 200 → invalid（镜像 web MAX_TITLE）
+  await assert.rejects(() => tools.rename_session({ id: 'a', title: 'x'.repeat(201) }), (e) => e.code === 'invalid')
 })
 ```
 
@@ -3272,7 +3295,7 @@ Expected: FAIL，`Cannot find module '.../src/tools.js'`
 
 ```js
 import { mkdir, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import * as core from '@csm/core'
 
 function countBy(arr) {
@@ -3282,6 +3305,9 @@ function countBy(arr) {
   for (const x of arr) o[x] = (o[x] ?? 0) + 1
   return o
 }
+
+/** 标题长度上限（I6 决策：core 不限，web/MCP 入口层封顶；镜像 web server.mjs 的 MAX_TITLE=200）。 */
+const MAX_TITLE = 200
 
 /** 创建 6 个 MCP 工具的实现函数（home 缺省用 CODEX_HOME）。 */
 export function createSessionTools({ home } = {}) {
@@ -3308,30 +3334,46 @@ export function createSessionTools({ home } = {}) {
         })),
       }
     },
-    async get_session({ id }) {
+    async get_session({ id } = {}) {
       const s = await load(id)
       return {
         id: s.id, title: s.title, cwd: s.cwd, model: s.model, provider: s.provider,
         createdAt: s.createdAt, updatedAt: s.updatedAt, tokens: s.tokens, archived: s.archived,
-        messages: s.messages, toolCallCounts: countBy(s.toolCalls),
+        messages: s.messages, toolCallCounts: countBy(s.toolCalls), badLines: s.badLines, // M-3：对齐 web detail/JSON 导出，对抗语料下透出不可解析行数
       }
     },
-    async rename_session({ id, title }) {
+    async rename_session({ id, title } = {}) {
+      // I-2（镜像 web MAX_TITLE=200）：入口层封顶，防一次 LLM 调用用超长标题永久污染 append-only 索引（此后每次 list/get 都 token 爆炸）
+      if (typeof title === 'string' && title.length > MAX_TITLE) {
+        throw new core.CsmError('invalid', `title too long (max ${MAX_TITLE} characters)`)
+      }
       return core.renameSession({ home: H, id, title })
     },
-    async archive_session({ id, force }) {
+    async archive_session({ id, force } = {}) {
       return core.archiveSession({ home: H, id, force })
     },
-    async delete_session({ id, force }) {
+    async delete_session({ id, force } = {}) {
       return core.deleteSession({ home: H, id, force })
     },
     async export_session({ id, format = 'md', outputPath } = {}) {
       const s = await load(id)
-      const text = core.renderExport(s, format)
-      // anchor 保证 outputPath 只能落在 CODEX_HOME 内：相对路径解析进 home，home 外绝对路径抛 invalid
-      const dest = core.anchor(H, outputPath ?? join(H, 'exports', `${id}.${format}`))
-      await mkdir(dirname(dest), { recursive: true })
-      await writeFile(dest, text)
+      const text = core.renderExport(s, format) // 非法 format 在此抛 invalid，早于任何 fs 副作用（I-3 顺序保证）
+      const exportsDir = join(H, 'exports')
+      let dest
+      try {
+        // anchor 保证 outputPath 只能落在 CODEX_HOME 内：相对路径解析进 home，home 外绝对路径抛 invalid
+        dest = core.anchor(H, outputPath ?? join(exportsDir, `${id}.${format}`))
+        await mkdir(dirname(dest), { recursive: true })
+        // I-1：拒绝覆盖 exports/ 之外的既有文件——session_index/rollout 是产品皇冠明珠，此为全产品唯一不可逆无备份写；
+        //      exports/ 内同名文件允许幂等重导（wx 独占创建，EEXIST → conflict）。
+        const insideExports = dest === exportsDir || dest.startsWith(exportsDir + sep)
+        await writeFile(dest, text, { flag: insideExports ? 'w' : 'wx' })
+      } catch (e) {
+        if (e instanceof core.CsmError) throw e // anchor 的路径逃逸 invalid 原样透出（测试 3 依赖）
+        // M-1：其余 fs/参数错误（EISDIR/EACCES/ENAMETOOLONG/NUL TypeError…）脱敏成域错误码，只暴露 errno 不泄漏绝对路径
+        if (e?.code === 'EEXIST') throw new core.CsmError('conflict', 'target file already exists; refusing to overwrite outside exports/')
+        throw new core.CsmError('invalid', `cannot write export: ${e?.code ?? 'unknown error'}`)
+      }
       return { path: dest, bytes: Buffer.byteLength(text) }
     },
   }
@@ -3341,7 +3383,7 @@ export function createSessionTools({ home } = {}) {
 **Step 4: 跑测试确认通过**
 
 Run: `node --test packages/plugin/tests/tools.test.js`
-Expected: PASS（3 tests）
+Expected: PASS（4 tests）
 
 **Step 5: Commit**
 
@@ -3349,6 +3391,27 @@ Expected: PASS（3 tests）
 git add packages/plugin/src/tools.js packages/plugin/tests/tools.test.js
 git commit -m "feat(plugin): 会话管理 MCP 工具逻辑（list/get/rename/archive/delete/export）"
 ```
+
+> **Task 10 质量审查修订（2026-09-26，判定"With fixes"：0 阻断 / 3 Important / 若干 Minor）**
+>
+> **两阶审查再次印证（继 Task 9 之后第二次）**：规格审查判 **YES**（代码与计划逐字节一致、契约逐行对照 core 源证明、RED 实证、69/69），但质量审查用实证探针（~15 个 mkdtemp home + 真实 ~/.codex 只读）发现 **3 个 Important 全是"计划级 bug"**——代码忠实实现了一个有缺陷的计划，故规格审查（只验"代码==计划"）结构上抓不到，只有质量审查（验"代码好不好"）能抓。其中 **I-2 直接违背本计划自己的 I6 决策**（line 1940「标题长度上限由 web/MCP 入口层约束」明确绑定 Task 8/10），**I-1 违背代码库自身「绝不覆盖已有文件」「宁可响亮失败也不静默覆盖」不变量**（mutate.js uniqueDest / COPYFILE_EXCL 备份）。
+>
+> **I-1（Important，Task 11 接线后即变 Blocking）— export_session 静默覆盖 CODEX_HOME 内任意既有文件、无备份**：原 `writeFile(dest, text)` 默认 `'w'` 旗标。`dest` 经 anchor 限制在 CODEX_HOME 内，但 **anchor 只护"不逃出 home"，不护"home 内的内容"**——而 home 内正是产品皇冠明珠（session_index.jsonl、活跃 rollout）。实证：`export_session({id, outputPath:'session_index.jsonl'})` → 索引被导出内容覆盖、**全部标题永久丢失且无 .csm-backups**；`outputPath` 指向会话自身 rollout → 1839B→290B、随后 `list_sessions` 计数 1→0、`get_session`→not_found（**彻底不可恢复**）。这是全产品唯一不可逆、无备份的写，由 LLM 一个自由字符串触发（威胁模型明确：LLM 可传任意 outputPath、语料视为对抗）。**修复**：`exports/` 外用 `wx` 独占创建（命中既有文件 EEXIST → `CsmError('conflict')`，拒绝覆盖）；`exports/` 内用 `'w'`（允许幂等重导同名导出文件）。（**注意 Node API 陷阱**：`fsPromises.writeFile(file, data, options)` 的第三参若为**纯字符串**表示的是 **encoding 而非 flag**——`'w'`/`'wx'` 会抛 `ERR_INVALID_ARG_VALUE: invalid encoding`；必须传对象 `{ flag: 'w'|'wx' }`。控制器初稿正踩此坑、且被 M-1 的 catch 吞成 `cannot write export: ERR_INVALID_ARG_VALUE`，连默认 `exports/a.md` 路径都写不出、把本已通过的测试 3 也带崩；fixer 在 RED→GREEN 的 GREEN 阶段抓到并 STOP，改成 `{ flag: insideExports ? 'w' : 'wx' }` 后才重派——TDD 强制 GREEN 正是为暴露这类计划级 bug。）
+> **I-2（Important）— rename_session 无标题长度上限，违背计划 I6 决策**：web 在 server.mjs 封顶 `MAX_TITLE=200`（超长→400 invalid），MCP 层不封，且 Task 11 计划的 zod（`title: z.string()`）也无 `.max()`——整个 MCP 栈缺失该上限。实证：一次 100 万字符标题被接受 → append-only 索引行涨到 1,000,067B → **此后每次 list_sessions 响应 ~1MB（~250K tokens）、web 列表也被毒化**，且索引追加语义使膨胀永久（改回标题后索引仍 1,000,416B，每次后续 rename 还要备份这坨）。**修复**：`rename_session` 入口镜像 web——`if (typeof title === 'string' && title.length > MAX_TITLE) throw new core.CsmError('invalid', \`title too long (max ${MAX_TITLE} characters)\`)`（core 仍负责非字符串/空校验）；`MAX_TITLE=200` 常量置于 tools.js（I6 决策：core 不限、入口层各自封顶，故与 web 各持一份是有意为之）。Task 11 zod 可再加 `.max(200)` 双保险。
+> **I-3（Important）— export_session 工具专属组合属性无回归测试**：计划的安全论证（「非法 format 先抛 invalid，`${id}.${format}` 不会拿到非法扩展名」）与 json 默认命名（`exports/<id>.json`）是**只存在于 tools.js 的组合逻辑**，core 的 renderExport 测试证明了"抛 invalid"但证明不了"抛在任何 fs 副作用之前的顺序"，也无任何测试覆盖 json 默认文件名。一次未来重构（如"先构造 dest 好让错误消息带上它"）会静默打破该顺序，之后 `format:'../../../etc/evil'` 式输入就能在校验前于 home 内 mkdir/写入受攻击者影响的名字。**修复**：测试 3 追加 json 默认路径 + 非法 format 零 fs 副作用断言（`readdir(home)` 仍为 `['exports','rel.md','sessions']`）。
+>
+> **控制器补强（质量审查 I-3 提案的缺口）**：质量审查建议的 I-3 测试只覆盖"组合属性"（json 路径 + 非法 format 顺序），而这些**在旧代码上也通过**（既有正确行为），不是 RED→GREEN 判别器；**I-1（覆盖→conflict）、I-2（超长→invalid）才是真正的行为变更，却没有判别测试**——没有它们，修复无回归保护、fixer 也无法展示真 RED→GREEN。故控制器新增**第 4 个测试块「安全护栏」**：(a) 在 home 根写 `precious.txt`，`export_session({outputPath:'precious.txt'})` 须 reject `conflict` 且原文件完好（I-1 判别器：旧码静默覆盖→不 reject→RED）；(b) `exports/` 内同名 md 连导两次须都成功且同路径（幂等重导回归保护）；(c) `rename_session({title:'x'.repeat(201)})` 须 reject `invalid`（I-2 判别器：旧码无封顶→接受→不 reject→RED）。**plugin 测试由 3 增至 4，全套由 69 增至 70**（core 55 + web 11 + plugin 4）。
+>
+> **Minor 顺修（随本次 fix commit）**：
+> - **M-1 错误脱敏**：原 `export_session` 的 mkdir/writeFile/anchor 会逃逸原始非-CsmError（实证清单：`outputPath:''`→EISDIR、父路径是文件→mkdir EEXIST、NUL 字节→realpathSafe 抛 ERR_INVALID_ARG_VALUE TypeError、5000 字符组件→ENAMETOOLONG、chmod000→EACCES、零参调用→解构 TypeError）。修复：把 anchor+mkdir+writeFile 包进 try——`e instanceof core.CsmError` 原样透出（anchor 路径逃逸的 invalid，测试 3 依赖）、`EEXIST`→conflict、其余→`CsmError('invalid', \`cannot write export: ${e.code}\`)`（只暴露 errno、不泄漏绝对路径，对齐 web I5 脱敏姿态）；并给 get/rename/archive/delete 补 `= {}` 默认参（list/export 本就有），消除零调解构 TypeError、保持 6 工具签名对称。
+> - **M-3 badLines**：`get_session` 原丢弃 `badLines`（web detail 与 JSON 导出都带）。对抗语料姿态下 LLM 应知道有不可解析行。修复：返回体加 `badLines: s.badLines`（一字段）。
+>
+> **实证正确、不改**：`countBy` 空原型（质量审查用含 `function_call name:'__proto__'×2/'constructor'/'toString'/'hasOwnProperty'` 的真实 rollout 验证：原型为 null、`__proto__`=2 为 own property、`constructor`=1、全局未污染、`JSON.stringify` 上线 `{"__proto__":2,...}` 经 `JSON.parse` 往返定义 own `__proto__` 无污染；naive-`{}` 复刻则重现两个文档化 bug）；`title ?? null`（无索引会话 get_session.title=null ≡ web detail、MD 标题 `# <uuid>`、JSON 导出 title=null 且不泄漏 archived/mtimeMs）。
+>
+> **延后**：**M-2**（list_sessions 的 `archived` 恒 false 字段 + archive 后无 MCP 工具能重新发现该会话、`archived:true` 混淆 archived_sessions/ 与 .csm-trash/）与 **M-4**（载荷体积：实测真实语料 list_sessions 141KB/~35K tokens、最坏 get_session 0.71MB/~190K tokens）→ **Task 11 SKILL.md 必须明文引导**（list 永远带过滤、大会话优先 export 而非 get_session、archived/trashed 会话从 list 消失但仍可按 id 操作），v0.2 再考虑 maxMessages/分页；**M-5**（写失败时 mkdir 残留目录树）+ **M-6**（anchor-realpath 与 writeFile 间的 TOCTOU；wx 已收窄；同用户进程无提权）→ 信息性，归 Task 13 遗留包。
+>
+> **修复 commit**：`git add packages/plugin/src/tools.js packages/plugin/tests/tools.test.js docs/plans/2026-09-26-codex-session-manager.md && git commit -m "fix(plugin): 质量审查修复（export 覆盖防护、rename 标题封顶、错误脱敏、badLines、安全护栏测试）"`（计划文档的质量修复修订随代码一并提交，匹配 Task 9 模式）
+> **复审要求**：fixer 须先覆盖测试（新 4 块）跑旧 tools.js 展示 **RED**（第 4 块 I-1/I-2 判别器失败），再覆盖 tools.js 跑 **GREEN（4/4 + 全套 70/70）**；复审须实证：I-1（导出到既有 session_index.jsonl / rollout / precious.txt → conflict 且原文件逐字节不变；exports/ 内重导幂等）、I-2（201 字符 → invalid、200 字符通过、与 web 一致）、I-3（新测试通过、非法 format 零副作用）、M-1（各 errno → 域错误码、无绝对路径泄漏、anchor 路径逃逸仍 invalid）、M-3（badLines 透出）、与计划逐字节一致、无回归。
 
 ---
 

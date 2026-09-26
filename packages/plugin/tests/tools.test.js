@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createSessionTools } from '../src/tools.js'
 import { backdate, makeHome, writeIndex, writeSession } from '../../core/tests/helpers/fixture.js'
@@ -43,4 +43,27 @@ test('export_session: 默认 CODEX_HOME/exports；outputPath 锚定在 CODEX_HOM
   const r2 = await tools.export_session({ id: 'a', outputPath: 'rel.md' })
   assert.equal(r2.path, join(home, 'rel.md'), '相对路径解析进 CODEX_HOME')
   await assert.rejects(() => tools.export_session({ id: 'a', outputPath: '/etc/evil.md' }), (e) => e.code === 'invalid')
+  // I-3：export_session 的工具专属组合属性——json 默认命名 + 非法 format 在任何 fs 写入前抛 invalid（零副作用）
+  const rj = await tools.export_session({ id: 'a', format: 'json' })
+  assert.equal(rj.path, join(home, 'exports', 'a.json'))
+  assert.equal(JSON.parse(await readFile(rj.path, 'utf8')).id, 'a')
+  await assert.rejects(() => tools.export_session({ id: 'a', format: '../../evil' }), (e) => e.code === 'invalid')
+  assert.deepEqual((await readdir(home)).sort(), ['exports', 'rel.md', 'sessions'], '非法 format ⇒ 零 fs 副作用')
+})
+
+test('安全护栏：export 拒绝覆盖 exports/ 外文件、rename 标题封顶', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await backdate(p)
+  const tools = createSessionTools({ home })
+  // I-1：outputPath 指向 exports/ 外的既有文件 → conflict 且原文件完好（皇冠明珠防护，全产品唯一不可逆写）
+  await writeFile(join(home, 'precious.txt'), 'ORIGINAL')
+  await assert.rejects(() => tools.export_session({ id: 'a', outputPath: 'precious.txt' }), (e) => e.code === 'conflict')
+  assert.equal(await readFile(join(home, 'precious.txt'), 'utf8'), 'ORIGINAL')
+  // exports/ 内同名文件允许幂等重导（不 conflict）
+  const e1 = await tools.export_session({ id: 'a', format: 'md' })
+  const e2 = await tools.export_session({ id: 'a', format: 'md' })
+  assert.equal(e1.path, e2.path)
+  // I-2：rename 标题超过 200 → invalid（镜像 web MAX_TITLE）
+  await assert.rejects(() => tools.rename_session({ id: 'a', title: 'x'.repeat(201) }), (e) => e.code === 'invalid')
 })
