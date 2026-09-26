@@ -2185,7 +2185,10 @@ git commit -m "fix(core): 导出质量审查修复（JSON 字段白名单、代�
 ```js
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { buildStats } from '../src/stats.js'
+import { archiveSession } from '../src/mutate.js'
 import { backdate, makeHome, writeIndex, writeSession } from './helpers/fixture.js'
 
 test('buildStats: 按天/项目/模型/供应商聚合', async () => {
@@ -2221,6 +2224,72 @@ test('buildStats: recent7 只计近 7 天更新的会话（前置修订 3）', a
   assert.equal(s.total, 2)
   assert.equal(s.recent7, 1, '仅未 backdate 者（mtime=now）在近 7 天内')
 })
+
+test('buildStats: archived 计入 archived、不进入 total 与 by* 分布（审查缺口 1）', async () => {
+  const home = await makeHome()
+  const pActive = await writeSession(home, { id: 'act', day: '2026-05-20', cwd: '/p1', model: 'gpt-5.5' })
+  await backdate(pActive, Date.now() - Date.parse('2026-05-20T12:00:00Z'))
+  const pArch = await writeSession(home, { id: 'arch', day: '2026-05-21', cwd: '/p2', model: 'gpt-9.9' })
+  await backdate(pArch, Date.now() - Date.parse('2026-05-21T12:00:00Z'))
+  await archiveSession({ home, id: 'arch' }) // 已 backdate，越过活跃防护
+  const s = await buildStats({ home })
+  assert.equal(s.total, 1, 'total 只计 active')
+  assert.equal(s.archived, 1)
+  assert.equal(s.byProject['/p1'], 1)
+  assert.ok(!('/p2' in s.byProject), 'archived 的 cwd 不进入 byProject')
+  assert.ok(!('gpt-9.9' in s.byModel), 'archived 的 model 不进入 byModel')
+  assert.ok(!('2026-05-21' in s.byDay), 'archived 的日期不进入 byDay')
+})
+
+test('buildStats: model 缺失（无 turn_context）的会话被 byModel 跳过（审查 Issue 3/缺口 2）', async () => {
+  const home = await makeHome()
+  const pOk = await writeSession(home, { id: 'ok', day: '2026-05-20', model: 'gpt-5.5' })
+  await backdate(pOk, Date.now() - Date.parse('2026-05-20T12:00:00Z'))
+  // 手写一个无 turn_context 的会话文件 → fastMeta 读不到 model → null
+  const dir = join(home, 'sessions', '2026', '05', '20')
+  await mkdir(dir, { recursive: true })
+  const pNoModel = join(dir, 'rollout-2026-05-20T00-00-00-nomodel.jsonl')
+  await writeFile(pNoModel, JSON.stringify({ timestamp: '2026-05-20T12:00:00Z', ordinal: 0, type: 'session_meta', payload: { id: 'nomodel', session_id: 'nomodel', cwd: '/p1', model_provider: 'azure' } }) + '\n')
+  await backdate(pNoModel, Date.now() - Date.parse('2026-05-20T12:00:00Z'))
+  const s = await buildStats({ home })
+  assert.equal(s.total, 2)
+  assert.equal(s.byModel['gpt-5.5'], 1)
+  assert.ok(!('nomodel' in s.byModel))
+  assert.equal(Object.values(s.byModel).reduce((a, b) => a + b, 0), 1, 'byModel 之和 < total（null model 被跳过）')
+  assert.equal(s.byProvider['azure'], 2, 'provider 仍计（session_meta 里有 model_provider）')
+})
+
+test('buildStats: 空 home 返回全零与空分布（审查缺口 3）', async () => {
+  const home = await makeHome()
+  const s = await buildStats({ home })
+  assert.equal(s.total, 0)
+  assert.equal(s.archived, 0)
+  assert.equal(s.recent7, 0)
+  for (const m of [s.byDay, s.byProject, s.byModel, s.byProvider]) {
+    assert.equal(Object.keys(m).length, 0)
+  }
+})
+
+test('buildStats: byDay 键按日期倒序（最近在前），供 Task 9 日期窗口渲染（审查缺口 4）', async () => {
+  const home = await makeHome()
+  const p1 = await writeSession(home, { id: 'd1', day: '2026-05-20' })
+  await backdate(p1, Date.now() - Date.parse('2026-05-20T12:00:00Z'))
+  const p2 = await writeSession(home, { id: 'd2', day: '2026-05-22' })
+  await backdate(p2, Date.now() - Date.parse('2026-05-22T12:00:00Z'))
+  const p3 = await writeSession(home, { id: 'd3', day: '2026-05-21' })
+  await backdate(p3, Date.now() - Date.parse('2026-05-21T12:00:00Z'))
+  const s = await buildStats({ home })
+  assert.deepEqual(Object.keys(s.byDay), ['2026-05-22', '2026-05-21', '2026-05-20'], 'byDay 键最近在前')
+})
+
+test('buildStats: 对抗性键不污染计数（审查 Issue 2：null 原型）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'evil', day: '2026-05-20', cwd: 'constructor' })
+  await backdate(p, Date.now() - Date.parse('2026-05-20T12:00:00Z'))
+  const s = await buildStats({ home })
+  assert.equal(s.byProject['constructor'], 1, 'constructor 作为普通键计 1，而非继承的函数')
+  assert.equal(typeof s.byProject['constructor'], 'number')
+})
 ```
 
 **Step 2: 跑测试确认失败**
@@ -2234,14 +2303,29 @@ Expected: FAIL，`Cannot find module '.../src/stats.js'`
 ```js
 import { listSessions } from './catalog.js'
 
-/** 汇总统计（纯只读）：总数/归档数/近7天 + 按天/项目/模型/供应商分布。 */
+const MS_PER_DAY = 86_400_000
+
+/**
+ * 汇总统计（纯只读）：一律基于 ACTIVE 会话（archived 单列）。
+ * @returns {Promise<{
+ *   total: number,                      // 活跃会话数（不含 archived；总数 = total + archived）
+ *   archived: number,                   // 归档会话数
+ *   recent7: number,                    // 近 7 天内更新的活跃会话（数值时间戳比较）
+ *   byDay: Record<string, number>,      // 键 = updatedAt 的 UTC 日期 YYYY-MM-DD；插入序 = listSessions 序（updatedAt 倒序，即最近在前）
+ *   byProject: Record<string, number>,  // 键 = cwd
+ *   byModel: Record<string, number>,    // 键 = model slug
+ *   byProvider: Record<string, number>  // 键 = provider
+ * }>}
+ * 契约：falsy 的 cwd/model/provider 键被跳过，故对应 by* 之和可能 < total（如少量 model=null 的会话）。
+ * by* 用 null 原型对象，杜绝 constructor/__proto__ 之类对抗键污染计数（审查 Issue 2）。
+ */
 export async function buildStats({ home }) {
   const all = await listSessions({ home, includeArchived: true })
   const active = all.filter((s) => !s.archived)
-  const byDay = {}
-  const byProject = {}
-  const byModel = {}
-  const byProvider = {}
+  const byDay = Object.create(null)
+  const byProject = Object.create(null)
+  const byModel = Object.create(null)
+  const byProvider = Object.create(null)
   const bump = (obj, key) => {
     if (key) obj[key] = (obj[key] ?? 0) + 1
   }
@@ -2251,7 +2335,7 @@ export async function buildStats({ home }) {
     bump(byModel, s.model)
     bump(byProvider, s.provider)
   }
-  const weekAgoMs = Date.now() - 7 * 86_400_000
+  const weekAgoMs = Date.now() - 7 * MS_PER_DAY
   return {
     total: active.length,
     archived: all.length - active.length,
@@ -2279,7 +2363,7 @@ export * from './stats.js'
 **Step 4: 跑 core 全部测试确认通过**
 
 Run: `node --test "packages/core/tests/*.test.js"`（Node 25 不接受裸目录参数）
-Expected: PASS（50 tests：paths 6 + reader 11 + catalog 9 + mutate 14 + export 8 + stats 2）
+Expected: PASS（55 tests：paths 6 + reader 11 + catalog 9 + mutate 14 + export 8 + stats 7）
 
 Run: `node -e "import('@csm/core').then(m => console.log(Object.keys(m).length + ' exports'))"`
 Expected: 输出 exports 数量 ≥ 15（实际应约 19：CsmError + codexHome/layout/anchor + parseSessionContent/readSessionFile/fastMeta + readIndex/listSessions/findSessionFile/findSessionFiles + renameSession/archiveSession/deleteSession + toMarkdown/toJson/buildResumeContext/renderExport + buildStats；验证 workspace 链接与汇总出口）
@@ -2290,6 +2374,20 @@ Expected: 输出 exports 数量 ≥ 15（实际应约 19：CsmError + codexHome/
 git add packages/core/src/stats.js packages/core/src/index.js packages/core/tests/stats.test.js docs/plans/2026-09-26-codex-session-manager.md
 git commit -m "feat(core): 统计聚合与包出口，core 完成"
 ```
+
+**Task 7 质量审查修订（2026-09-26，判定"With fixes"——全部加法式，无语义变更）：**
+
+规格审查已过（SHA-256 逐字节一致、50/50×3、真实语料 smoke total 640/archived 59/recent7 30 且证明确为只读）。质量审查的设计裁决全部**支持现实现**：`total` 活跃语义正确（看板标"活跃会话"，Task 9 勿改名）、raw map + 前端排序的分工正确（勿改成排序数组/top-N）、null 键省略可接受（记录+测试，勿加 '(unknown)' 桶）、barrel `export *` 19 名皆公开 API 的正确务实选择（勿收窄）。需落地的加法式修复：
+
+- **Issue 2（Minor，改代码）**：`bump` 的四个分布图原为普通 `{}`，对抗性 cwd/model（如 `constructor`/`__proto__`）会读到 `Object.prototype` 继承值 → 计数被污染成字符串拼接（`byProject['constructor']` 变 `"function Object(){…}1"`）或静默丢弃。改 `Object.create(null)`（1 行、零下游代价：null 原型不过 JSON、属性访问/`Object.keys`/`in` 均正常）。真实可达性≈0（cwd 恒为绝对路径），但一行堵死整类 bug。**判别性回归**：cwd=`constructor` 的会话 → 旧代码 `typeof byProject['constructor']` 为 string（RED），新代码为 number 且值 1（GREEN）。
+- **Issue 3/4/5（Minor，补 JSDoc）**：`buildStats` 原只有一行 JSDoc，返回体契约未记录。补 `@returns` 记录：`total`=活跃数（不含归档，总数=total+archived）、`byDay` 键为 **UTC** 日期（机器在 UTC+8 时凌晨会话会落前一天——文档化而非改本地时区，否则跨机器不可比）、falsy 键跳过致 **by\* 之和可能 < total**（真实语料 byModel 之和 637<640，3 个 model=null）、byDay 插入序=最近在前。另加 `MS_PER_DAY` 常量自文档化魔数。
+- **测试缺口（+5 tests → stats 7、套件 55）**：① archived 排除（1 active+1 archived → total 1/archived 1，archived 的 cwd/model/day 不进 by\*）；② null-model 省略（手写无 turn_context 会话 → byModel 跳过、byModel 之和<total、provider 仍计）；③ 空 home 全零（用 `Object.keys(m).length===0` 断言，避开 null 原型的 deepEqual 原型比较）；④ byDay 倒序（钉住"最近在前"契约供 Task 9）；⑤ 原型污染回归（Issue 2）。
+- **Issue 1（Important，但属 Task 9 计划前端代码，非本 diff）**：byDay 是时间序列，而 Task 9 计划的通用 `rows(obj,limit)` 按**计数**排序 → "最近 14 天"框会渲染**最忙的** 14 天（真实语料为 7/8 月）而非**最近** 14 天（9/12–26），与标签自相矛盾。**已记入下方 Task 9 待办**：byDay 必须按日期键切片 `Object.entries(s.byDay).sort((a,b)=>b[0].localeCompare(a[0])).slice(0,14)`，不能走计数排序的 `rows()`。
+- **Issue 6（Info，已改设计文档）**：`docs/plans/2026-09-26-codex-session-manager-design.md` 原承诺"统计消息数与字符量估算"，实现只做会话计数（正确 YAGNI：消息/字符统计需全量解析 4.7GB、单文件达 1GB，违背只读轻扫原则）。已订正设计文档该行，注明 v0.1 范围裁剪 + 补 byProvider 维度。
+
+**Task 9 待办（由 Task 7 Issue 1 记录，实施 Task 9 时必须处理）：** 看板"最近 N 天"图必须对 `byDay` 按**日期键**排序切片（最近在前），不可套用按计数排序的通用 `rows()`；其余三个 by\*（project/model/provider）按计数排序取 top-N 是对的。
+
+修复提交：`git add packages/core/src/stats.js packages/core/tests/stats.test.js docs/plans/2026-09-26-codex-session-manager.md docs/plans/2026-09-26-codex-session-manager-design.md && git commit -m "fix(core): 统计质量审查修复（null 原型防污染、@returns 契约、补测）"`（index.js 无需改，barrel 已含 stats）。
 
 ---
 

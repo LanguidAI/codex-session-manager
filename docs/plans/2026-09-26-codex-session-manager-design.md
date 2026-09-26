@@ -88,7 +88,7 @@ core 支持 `CODEX_HOME` 环境变量覆盖（默认 `~/.codex`），测试使�
 - `buildResumeContext(id)`：标题 + cwd + 模型 + 首条用户目标 + 最近消息摘录的紧凑 Markdown
 
 ### core/stats
-- `buildStats()`：按天/项目/模型统计会话数与消息数、字符量估算
+- `buildStats()`：按天/项目/模型/供应商统计**活跃会话数**（另报归档数、近 7 天数）。仅做会话计数——消息数/字符量估算需全量解析（真实语料 4.7GB、单文件达 1GB），违背只读轻量扫描原则，故 v0.1 明确不做（YAGNI，Task 7 质量审查确认）。
 
 ### web/server（REST，全部走 core）
 - `GET /api/sessions?q=&cwd=&model=`
