@@ -5,8 +5,9 @@
  * 2) 备份并更新 $CODEX_HOME/config.toml（[marketplaces.csm] + [plugins."session-manager@csm"]）
  * --uninstall 反向移除。
  */
+import { realpathSync } from 'node:fs'
 import { copyFile, cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { codexHome } from '@csm/core'
 
@@ -18,10 +19,19 @@ function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/** 在 TOML 文本中插入或原地替换一个节（节内容到下一个 [ 或文件尾为止）。 */
+/** 不抛错的 realpath（is-main 守卫用：argv[1] 异常时退回原值，避免 import 期崩溃）。 */
+function safeRealpath(p) {
+  try {
+    return realpathSync(p)
+  } catch {
+    return p
+  }
+}
+
+/** 在 TOML 文本中插入或原地替换一个节（节内容到下一个 [ 或文件尾为止）。header 行允许尾随注释。 */
 export function upsertTomlSection(text, header, lines) {
   const block = [header, ...lines].join('\n')
-  const re = new RegExp(`^${escapeRe(header)}[ \\t]*$`, 'm')
+  const re = new RegExp(`^${escapeRe(header)}[ \\t]*(?:#.*)?$`, 'm')
   const m = re.exec(text)
   if (!m) {
     const gap = text.length === 0 || text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n'
@@ -34,9 +44,9 @@ export function upsertTomlSection(text, header, lines) {
   return `${text.slice(0, m.index)}${block}\n\n${text.slice(end).replace(/^\n+/, '')}`
 }
 
-/** 从 TOML 文本中删除一个节（含其键值行）。 */
+/** 从 TOML 文本中删除一个节（含其键值行）。header 行允许尾随注释。 */
 export function removeTomlSection(text, header) {
-  const re = new RegExp(`^${escapeRe(header)}[ \\t]*$`, 'm')
+  const re = new RegExp(`^${escapeRe(header)}[ \\t]*(?:#.*)?$`, 'm')
   const m = re.exec(text)
   if (!m) return text
   const afterHeader = m.index + m[0].length
@@ -44,6 +54,16 @@ export function removeTomlSection(text, header) {
   const next = rest.search(/^\[/m)
   const end = next === -1 ? text.length : afterHeader + next
   return `${text.slice(0, m.index)}${text.slice(end).replace(/^\n+/, '')}`
+}
+
+/** 写前自检：构造出的 config 不得含重复节 header（正则 TOML 编辑的安全网，拒绝写坏配置）。 */
+function assertNoDuplicateSections(text) {
+  for (const header of [`[marketplaces.${MARKET_NAME}]`, `[plugins."${PLUGIN_NAME}@${MARKET_NAME}"]`]) {
+    const found = text.match(new RegExp(`^${escapeRe(header)}`, 'gm'))
+    if (found && found.length > 1) {
+      throw new Error(`config.toml self-check: duplicate section ${header} (${found.length}x), refusing to write (original config unchanged)`)
+    }
+  }
 }
 
 async function readConfig(home) {
@@ -73,7 +93,12 @@ export async function installPlugin({ home = codexHome(), pluginDir = HERE } = {
   await rm(dest, { recursive: true, force: true })
   await cp(pluginDir, dest, {
     recursive: true,
-    filter: (src) => !src.includes('node_modules') && !src.includes(`${join('tests', '')}`),
+    // 段级匹配：仅当 node_modules/tests 作为 relative(pluginDir) 路径的完整一段时排除
+    // （避免子串误伤：如 pluginDir 路径本身含 "tests"、或 mytests.js 这类合法文件）
+    filter: (src) => {
+      const segs = relative(pluginDir, src).split(sep)
+      return !segs.includes('node_modules') && !segs.includes('tests')
+    },
   })
   // .mcp.json 物化：MCP server 从仓库目录运行（保证 @csm/core 与 sdk 依赖可解析）
   const mcp = {
@@ -108,6 +133,7 @@ export async function installPlugin({ home = codexHome(), pluginDir = HERE } = {
   let cfg = await readConfig(home)
   cfg = upsertTomlSection(cfg, `[marketplaces.${MARKET_NAME}]`, ['source_type = "local"', `source = ${JSON.stringify(marketDir)}`])
   cfg = upsertTomlSection(cfg, `[plugins."${PLUGIN_NAME}@${MARKET_NAME}"]`, ['enabled = true'])
+  assertNoDuplicateSections(cfg) // 写前自检：发现重复节即拒绝写入（保护用户 config）
   await writeConfigWithBackup(home, cfg)
   return { marketDir, configPath: join(home, 'config.toml') }
 }
@@ -121,10 +147,10 @@ export async function uninstallPlugin({ home = codexHome() } = {}) {
   await rm(join(home, 'marketplaces', MARKET_NAME), { recursive: true, force: true })
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (process.argv[1] && safeRealpath(fileURLToPath(import.meta.url)) === safeRealpath(process.argv[1])) {
   const uninstall = process.argv.includes('--uninstall')
   const r = uninstall ? await uninstallPlugin() : await installPlugin()
   console.log(uninstall
     ? '已卸载 session-manager 插件（config.toml 已备份，市场目录已移除）。重启 Codex Desktop 生效。'
-    : `已安装 session-manager 插件 → ${r.marketDir}\nconfig.toml 已更新并备份。重启 Codex Desktop 后在插件列表启用即可。`)
+    : `已安装 session-manager 插件 → ${r.marketDir}\nconfig.toml 已更新（原文件存在时已备份）。重启 Codex Desktop 后在插件列表启用即可。`)
 }
