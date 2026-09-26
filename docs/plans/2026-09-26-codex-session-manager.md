@@ -3648,7 +3648,7 @@ git commit -m "feat(plugin): MCP server 接线、插件清单与 session-manager
 ```js
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { installPlugin, removeTomlSection, uninstallPlugin, upsertTomlSection } from '../install.mjs'
 import { makeHome } from '../../core/tests/helpers/fixture.js'
@@ -3700,8 +3700,8 @@ test('installPlugin: 市场目录 + 清单 + config 条目 + 备份 + 幂等', a
   assert.ok(cfg.includes('[plugins."session-manager@csm"]'))
   assert.ok(cfg.includes('enabled = true'))
   assert.ok(cfg.includes('localeOverride'), '用户原配置未破坏')
-  const backups = (await readFile(join(home, 'config.toml'), 'utf8')).length
-  assert.ok(backups > 0)
+  const bakFiles = (await readdir(home)).filter((f) => f.startsWith('config.toml.bak-csm-'))
+  assert.ok(bakFiles.length >= 1, 'config.toml 修改前已备份')
   await installPlugin({ home, pluginDir }) // 幂等
   const cfg2 = await readFile(join(home, 'config.toml'), 'utf8')
   assert.equal(cfg2.split('[marketplaces.csm]').length, 2)
@@ -3866,7 +3866,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 Run: `node --test packages/plugin/tests/install.test.js`
 Expected: PASS（4 tests）
 
-> 若 `cp` 的 filter 行为与断言冲突（tests 目录被复制等），按测试期望调整 filter；核心断言是 marketplace.json、plugin.json、.mcp.json 物化内容与 config.toml 变更。
+> 控制器已实证 Step 3 的 `cp` filter 正确（详见本节末「Task 12 控制器预审修订」核验 1）：`node_modules/` 与 `tests/` 整棵子树被排除、其余文件全保留，故本步应直接 PASS、**无需调整 filter**。若意外 FAIL，**STOP 并附证据上报**（勿擅自改 filter 或计划）。测试核心断言：marketplace.json 与 plugin.json 被复制入市场、.mcp.json 物化内容（cwd=仓库 pluginDir、args 末位 server.mjs）、config.toml 变更（两节新增 + 原配置保留 + 备份创建 + 幂等不重复）。
 
 **Step 5: Commit**
 
@@ -3874,6 +3874,16 @@ Expected: PASS（4 tests）
 git add packages/plugin/install.mjs packages/plugin/tests/install.test.js
 git commit -m "feat(plugin): 本地 marketplace 安装/卸载脚本（config.toml 安全 upsert + 备份）"
 ```
+
+> **Task 12 控制器预审修订（2026-09-27，控制器派发前实证：cp filter 语义、cp 父目录自动创建、TOML 正则 LF/CRLF/边界、CLI is-main 守卫；发现 1 处占位测试断言并强化——install.mjs 本体经实证正确、无需改；amendments 以 docs(plan) 单独提交后再派 implementer）**
+>
+> **修订 1 — install.test.js 备份断言强化（占位 bug 修正）**：原测试「备份」断言为 `const backups = (await readFile(join(home,'config.toml'),'utf8')).length; assert.ok(backups > 0)`——这是**占位/错误**：它读 config.toml 的字节长度、变量却命名「backups」、断言 >0（恒真），**根本没验证备份文件是否创建**，与测试名「…+ 备份 + 幂等」不符。已强化为 `const bakFiles = (await readdir(home)).filter(f=>f.startsWith('config.toml.bak-csm-')); assert.ok(bakFiles.length >= 1, 'config.toml 修改前已备份')`，真正覆盖「修改 config.toml 前先备份」这一安全特性；测试 import 相应加 `readdir`。**install.mjs 无需改**（writeConfigWithBackup 已正确 `copyFile` 到 `config.toml.bak-csm-<ts>`，现被测试真实验证）。
+> **核验 1 — `cp` filter + cp/rm 行为（Step 3，实证正确、无需改）**：探针（临时树含 node_modules/tests/src/.codex-plugin/server.mjs/.mcp.json）证实 filter `(src)=>!src.includes('node_modules') && !src.includes(join('tests',''))` 正确排除 `node_modules/` 与 `tests/` 整棵子树、保留其余全部文件。注意 `join('tests','')==='tests'`（**非 'tests/'**；path.join 对空段丢弃尾分隔符、只剩 'tests'），故 `.includes('tests')` 偏宽——但插件目录里唯一含 'tests' 子串的路径就是 tests/ 目录（server.mjs/install.mjs/package.json/.codex-plugin/.mcp.json/skills/src/tools.js 均不含 'tests'；'tools'≠'tests'），安全无误伤；偏宽恰好匹配 tests 目录**本身**（不只其内容），cp 对目录返回 false 即跳过整棵子树（不留空 tests/）。**补充探针**：`cp(src,dest,{recursive:true})` 会**自动创建 dest 的全部父目录**（首次安装 `home/marketplaces/csm/plugins/session-manager` 不存在 → cp 创建整棵树、无需先 mkdir）；`rm(dest,{recursive:true,force:true})` 对不存在的 dest 不报错（force 兜底），install.mjs「先 rm 再 cp」序列安全。**结论：复制逻辑 byte-exact、勿改**（原 Step 4 酌情 note 已改为「已验证 + 失败即 STOP」）。
+> **核验 2 — TOML 正则（upsertTomlSection/removeTomlSection，健壮、无需改）**：探针复现计划两函数，测 LF/CRLF/幂等/相似前缀/中间节/节内注释/带引号 header：① LF 追加新节（csm 加入、desktop+openai-bundled 保留）；② LF 幂等（二次 upsert 同节原地替换、节数仍 1、旧值 /m 被 /m2 取代无残留）；③ 相似前缀（upsert `[marketplaces.csm]` 不动 `[marketplaces.csm-foo]`——escapeRe + `^…[ \t]*$` 锚定完整 header 行）；④ **CRLF 二次 upsert 节数仍=1（无重复追加 bug**——首次对 CRLF 文件追加 LF 节、二次找到该 LF 节原地替换）；⑤ remove 中间节（删 [desktop] 连带其 localeOverride、保留 openai-bundled）；⑥ 节内注释连带删（remove [a] 连节内 # cmt 一并删）；⑦ 带引号 header `[plugins."session-manager@csm"]` 删净（escapeRe 对引号/@ 处理正确）。**全部通过，TOML 逻辑勿改**。
+> **核验 3 — CLI is-main 守卫（line 3855，npm run 生效、无需改）**：`fileURLToPath(import.meta.url)===process.argv[1]` 实证：**相对路径调用（`node sub/install.mjs`，即 `npm run install:plugin` 的方式）→ Node 把 argv[1] 解析为真实绝对路径、与 import.meta.url 一致、守卫触发 ✓**；npm run 场景同样触发 ✓。仅「绝对路径调用且路径经 symlink」（如 `node /tmp/…`，/tmp→/private/tmp）会因 argv[1] 保留未解析而守卫失败——但真实仓库路径无 symlink 组件、Task 13 走 npm run（相对），非真实路径（信息性记录）。
+>
+> **信息性（记录，不改）**：① `writeConfigWithBackup` 备份名仅 `Date.now()`（无随机后缀），同毫秒内两次写会碰撞致第二个备份覆盖第一个（对比 core mutate.js 用 `<ts>-<rand>/`）——真实安装单次运行不会触发，Task 13 可视需要加随机后缀；② TOML 正则假定「节头是行首未缩进 `[`、多行数组值缩进」（标准 TOML 风格），Codex config.toml 符合，Task 13 真实安装验证；③ `join('tests','')==='tests'` 写法略反直觉（作者本意或为 'tests/'），功能如上正确；④ marketplace.json/plugin.json 为 Codex marketplace schema、**暂定**（`PluginMcpServerConfig`/`default_tools_approval_mode` 已确认是真实 Codex 字段；marketplace 清单结构待 Task 13 真实安装核验）。
+> **依赖/契约已核实**：`cp`/`rm`/`copyFile`/`mkdir`/`readFile`/`readdir`/`stat`/`writeFile` 均在 node:fs/promises（cp 需 Node≥16.7、rm≥14.14，本仓 engines≥22）；`codexHome` 由 @csm/core barrel 导出；测试 import `makeHome` 自 core fixture（临时 home，绝不碰真实 ~/.codex）；install.test.js 的 4 测试与既有 tools.test.js 4 测试并存，**全套测试 70 → 74**。
 
 ---
 
