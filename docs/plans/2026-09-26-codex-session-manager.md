@@ -68,13 +68,15 @@
   "type": "module",
   "workspaces": ["packages/core", "packages/web", "packages/plugin"],
   "scripts": {
-    "test": "node --test packages/core/tests packages/web/tests packages/plugin/tests",
+    "test": "node --test 'packages/*/tests/*.test.js'",
     "web": "node packages/web/server.mjs",
     "install:plugin": "node packages/plugin/install.mjs",
     "uninstall:plugin": "node packages/plugin/install.mjs --uninstall"
   }
 }
 ```
+
+> 修订（2026-09-26）：Node 25 的 `node --test <目录>` 不再展开目录（会把目录当单个测试文件执行而失败），改用引号 glob；node 自身解析通配，未匹配的包目录（tests 为空/不存在）容忍且退出码 0。
 
 **Step 2: 写三个子包 package.json**
 
@@ -1261,8 +1263,8 @@ export * from './stats.js'
 
 **Step 4: 跑 core 全部测试确认通过**
 
-Run: `node --test packages/core/tests`
-Expected: PASS（22 tests：paths 4 + reader 3 + catalog 6 + mutate 6 + export 3 + stats 1，允许总数略有出入但必须全绿）
+Run: `node --test "packages/core/tests/*.test.js"`（Node 25 不接受裸目录参数）
+Expected: PASS（25 tests：paths 6 + reader 3 + catalog 6 + mutate 6 + export 3 + stats 1，允许总数略有出入但必须全绿）
 
 Run: `node -e "import('@csm/core').then(m => console.log(Object.keys(m).length + ' exports'))"`
 Expected: 输出 exports 数量 ≥ 15（验证 workspace 链接与汇总出口）
