@@ -38,6 +38,12 @@
 
 4. **`$CODEX_HOME/archived_sessions/`** — 官方归档目录（Desktop 自己就是把文件移进来）。
 
+5. **⚠️ 子代理线程的双 id**（Task 4 质量审查实测，190/709 文件）：subagent 派生线程（`thread_source: "subagent"`）的 `payload.session_id` = **父线程** id，`payload.id` = **自身** id；rollout 文件名 UUID 与 `session_index.jsonl` 的键都是**自身 id**（423 个索引 id 中 420 个匹配 payload.id，仅 371 个匹配 session_id）。**规范 id 一律取 `payload.id ?? payload.session_id`**（所有实测文件都有 payload.id；session_id 仅作老文件回退）。
+
+6. **⚠️ resume 分片文件**（实测 6 个 id 共 16 个文件）：同一线程恢复续写会生成多个 `rollout-<ts>-<threadId>_<forkUuid>.jsonl`，`payload.id` 相同；且 Desktop **不因 resume 刷新索引** updated_at（实测比文件 mtime 旧 6 天）。因此：列表**按 id 去重、保留 mtime 最新**的记录；`updatedAt = max(索引时间, mtime)`；`findSessionFile` 在同一 location 内取 **mtime 最新**的文件（location 优先级 active > archived > trash 不变）。
+
+7. **时间戳精度不齐**：索引 `updated_at` 小数位有 4/5/6 位（546 行中 11/50/485），mtime ISO 恒 3 位 —— 排序与比较必须用**数值时间戳**（`Date.parse` / `mtimeMs`），字符串比较在同一秒内会翻转。索引 `updated_at` 还可能是非字符串脏值，读取时需类型守卫。
+
 ### Codex 插件/市场格式（从 openai-bundled 实物采样）
 
 - 市场目录：`<market>/.agents/plugins/marketplace.json`：
@@ -1241,6 +1247,275 @@ Expected: PASS（6 tests）
 git add packages/core/src/catalog.js packages/core/tests/catalog.test.js
 git commit -m "feat(core): 会话目录（索引合并、过滤搜索、active/archived/trash 定位）"
 ```
+
+### Task 4 修订（质量审查修正，后续任务以本节为准）
+
+质量审查用真实语料实证了 2 个 Critical + 2 个 Important + 若干 Minor，以 fix 提交修正（对应背景事实第 5/6/7 条）：
+
+- **C1**：规范 id 优先级写反——子代理线程 `session_id`=父线程 id、`payload.id`=自身 id；原实现 `session_id ?? id` 使 27% 真实会话无法按 id 定位（findSessionFile→null）、列表挂父线程标题、52 行重复 id。修正：`p.id ?? p.session_id`（reader.js 两处）。
+- **C2**：resume 分片（同 id 多文件）无去重——列表重复 N 行、findSessionFile 返回 readdir 顺序的任意（实测陈旧 6 天）文件；设计文档 §5 本就要求按 id 去重。修正：listSessions 按 id 保留 mtime 最新记录；findSessionFile 同 location 取 mtime 最新。
+- **I1**：索引 updated_at 优先违反"磁盘为准"（resume 不刷索引 → 今天用过的线程排到 6 天前）。修正：`updatedAt = max(索引时间, mtime)`。
+- **I2**：裸 `catch { continue }` 会静默吞掉编程错误（TypeError 等）导致会话无声消失。修正：仅容忍带 `.code` 的文件系统错误，其余上抛。
+- **M1**：字符串比较排序在混合小数精度下同一秒内翻转；索引脏值（非字符串 updated_at）泄漏。修正：数值 sortMs 排序 + readIndex 类型守卫。
+- **M2**：q 跨字段拼接误匹配、cwd 大小写敏感。修正：逐字段匹配、cwd 双侧小写。
+- **M4**：`findSessionFile(home, '')` 全树扫描。修正：空/非字符串 id 直接返回 null。
+
+**reader.js 两处 id 优先级（C1）：**
+
+- `handleLine` 的 session_meta 分支：`session.id = p.session_id ?? p.id ?? session.id` → `session.id = p.id ?? p.session_id ?? session.id // 规范 id：payload.id 为线程自身 id；子代理线程的 session_id 是父线程（语料实测）`
+- `fastMeta` 的 session_meta 分支：`meta.id = p.session_id ?? p.id ?? meta.id` → `meta.id = p.id ?? p.session_id ?? meta.id`
+
+**tests/helpers/fixture.js 三处扩展（子代理 + resume 形态）：**
+
+1. `rolloutLines` 解构参数增加 `parentId`（默认 undefined），session_meta 行改为 `session_id: parentId ?? id`（其余字段不变）。
+2. `sessionRelPath` 增加第三参 `fork`：
+```js
+/** 会话文件相对 CODEX_HOME 的路径（YYYY/MM/DD 目录 + rollout 文件名含 id；fork 模拟 resume 分片）。 */
+export function sessionRelPath(id, day = '2026-05-20', fork) {
+  const [y, m, d] = day.split('-')
+  return join('sessions', y, m, d, `rollout-${day}T00-00-00-${id}${fork ? `_${fork}` : ''}.jsonl`)
+}
+```
+3. `writeSession` 透传 fork：`const p = join(home, sessionRelPath(opts.id, opts.day, opts.fork))`（其余不变）。
+
+**catalog.js（修订后完整实现，取代上文 Step 3）：**
+
+```js
+import { readdir, readFile, stat } from 'node:fs/promises'
+import { basename, join } from 'node:path'
+import { fastMeta } from './reader.js'
+import { layout } from './paths.js'
+
+/** 读 session_index.jsonl → Map<id, {title, updatedAt}>；同 id 后行覆盖前行；非字符串 updated_at 视为无。 */
+export async function readIndex(home) {
+  const map = new Map()
+  let content
+  try {
+    content = await readFile(layout(home).index, 'utf8')
+  } catch (e) {
+    if (e.code === 'ENOENT') return map
+    throw e
+  }
+  for (const raw of content.split('\n')) {
+    if (!raw.trim()) continue
+    let entry
+    try { entry = JSON.parse(raw) } catch { continue }
+    if (typeof entry?.id === 'string') {
+      map.set(entry.id, {
+        title: entry.thread_name ?? null,
+        updatedAt: typeof entry.updated_at === 'string' ? entry.updated_at : null,
+      })
+    }
+  }
+  return map
+}
+
+/**
+ * 递归遍历目录下所有 .jsonl 文件；目录不存在（ENOENT）时产出空。
+ * 其他目录级错误（如 EACCES）上抛——失败要响亮，不静默缺会话。
+ * 符号链接目录/文件不跟随（Dirent.isDirectory/isFile 对 symlink 均为 false）。
+ */
+async function* walkJsonl(dir) {
+  let entries
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch (e) {
+    if (e.code === 'ENOENT') return
+    throw e
+  }
+  for (const ent of entries) {
+    const p = join(dir, ent.name)
+    if (ent.isDirectory()) yield* walkJsonl(p)
+    else if (ent.isFile() && ent.name.endsWith('.jsonl')) yield p
+  }
+}
+
+/** 文件系统级错误（带 .code：ENOENT/EACCES/EMFILE/ELOOP 等）可按文件跳过；编程错误上抛，避免静默吞 bug。 */
+function isFsError(e) {
+  return typeof e?.code === 'string'
+}
+
+/**
+ * 列出会话（索引标题 + 磁盘元数据合并，磁盘为准）。
+ * 审查修订：同 id（resume 分片）去重保留 mtime 最新记录；
+ * updatedAt 取索引时间与 mtime 的较新者（索引不因 resume 刷新，不能遮蔽磁盘活动）；
+ * 排序用数值时间戳（索引小数精度不齐，字符串比较不可靠）。
+ * @returns {Promise<Array>} 按 updatedAt 倒序的会话摘要
+ */
+export async function listSessions({ home, q, cwd, model, includeArchived = false } = {}) {
+  const l = layout(home)
+  const index = await readIndex(home)
+  const dirs = includeArchived
+    ? [[l.sessionsDir, false], [l.archivedDir, true]]
+    : [[l.sessionsDir, false]]
+  const byId = new Map()
+  for (const [dir, archived] of dirs) {
+    for await (const p of walkJsonl(dir)) {
+      // 单文件读取失败（扫描期间被 Codex 删除/权限/符号链接环等）跳过，不打断整个列表（审查修订）
+      let meta
+      let st
+      try {
+        meta = await fastMeta(p)
+        st = await stat(p)
+      } catch (e) {
+        if (isFsError(e)) continue
+        throw e
+      }
+      if (!meta.id) continue
+      const idx = index.get(meta.id)
+      const idxMs = idx?.updatedAt ? Date.parse(idx.updatedAt) : NaN
+      const useIndex = Number.isFinite(idxMs) && idxMs > st.mtimeMs
+      const rec = {
+        id: meta.id,
+        title: idx?.title ?? '(未命名)',
+        cwd: meta.cwd,
+        provider: meta.provider,
+        model: meta.model,
+        createdAt: meta.createdAt,
+        updatedAt: useIndex ? idx.updatedAt : st.mtime.toISOString(),
+        size: st.size,
+        archived,
+        path: p,
+        // 内部字段（返回前删除）：排序用数值时间戳、去重/较新比较用 mtime
+        sortMs: useIndex ? idxMs : st.mtimeMs,
+        mtimeMs: st.mtimeMs,
+      }
+      if (q) {
+        const needle = String(q).toLowerCase()
+        const hit = [rec.title, rec.id, rec.cwd ?? ''].some((f) => String(f).toLowerCase().includes(needle))
+        if (!hit) continue
+      }
+      if (cwd && !(rec.cwd ?? '').toLowerCase().includes(String(cwd).toLowerCase())) continue
+      if (model && rec.model !== model) continue
+      const prev = byId.get(rec.id)
+      if (!prev || rec.mtimeMs > prev.mtimeMs) byId.set(rec.id, rec)
+    }
+  }
+  const out = [...byId.values()]
+  out.sort((a, b) => b.sortMs - a.sortMs)
+  for (const rec of out) {
+    delete rec.sortMs
+    delete rec.mtimeMs
+  }
+  return out
+}
+
+/**
+ * 按 id 定位会话文件；文件名含 id 才打开解析（性能护栏）。
+ * 审查修订：同 id 多文件（resume 分片）返回该 location 内 mtime 最新者（不再依赖 readdir 顺序）；
+ * location 优先级 active > archived > trash；空/非字符串 id 直接返回 null。
+ * @returns {Promise<null | {path: string, location: 'active'|'archived'|'trash', mtimeMs: number, size: number}>}
+ */
+export async function findSessionFile(home, id) {
+  if (typeof id !== 'string' || id === '') return null
+  const l = layout(home)
+  for (const [dir, location] of [[l.sessionsDir, 'active'], [l.archivedDir, 'archived'], [l.trashDir, 'trash']]) {
+    let best = null
+    for await (const p of walkJsonl(dir)) {
+      if (!basename(p).includes(id)) continue
+      // 单文件读取失败跳过继续找（审查修订）
+      try {
+        const meta = await fastMeta(p)
+        if (meta.id !== id) continue
+        const st = await stat(p)
+        if (!best || st.mtimeMs > best.mtimeMs) {
+          best = { path: p, location, mtimeMs: st.mtimeMs, size: st.size }
+        }
+      } catch (e) {
+        if (isFsError(e)) continue
+        throw e
+      }
+    }
+    if (best) return best
+  }
+  return null
+}
+```
+
+**reader.test.js 追加第 11 个用例（C1 回归）：**
+
+```js
+test('子代理线程：规范 id 取 payload.id（session_id 是父线程）', async () => {
+  const content = rolloutLines({ id: 'own-1', parentId: 'parent-9' })
+  assert.equal(parseSessionContent(content).id, 'own-1')
+  const home = await makeHome()
+  const p = join(home, 'sub.jsonl')
+  await writeFile(p, content)
+  assert.equal((await fastMeta(p)).id, 'own-1')
+})
+```
+
+**catalog.test.js：第 2 个用例改为（双 backdate 确定性 + 索引较新断言）：**
+
+```js
+test('listSessions: 索引标题合并 + 未命名回退 + 按 updatedAt 倒序', async () => {
+  const home = await makeHome()
+  const pa = await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await backdate(pa, Date.now() - Date.parse('2026-05-20T12:00:00Z'))
+  const pb = await writeSession(home, { id: 'b', day: '2026-05-21', cwd: '/proj/beta' })
+  await backdate(pb, Date.now() - Date.parse('2026-05-21T12:00:00Z'))
+  await writeIndex(home, [{ id: 'a', thread_name: '修复登录', updated_at: '2026-05-21T20:00:00Z' }])
+  const list = await listSessions({ home })
+  assert.equal(list.length, 2)
+  assert.equal(list[0].id, 'a', '索引 updatedAt（05-21T20）比 b 的 mtime（05-21T12）新 → 排前')
+  assert.equal(list[0].title, '修复登录')
+  assert.equal(list[0].updatedAt, '2026-05-21T20:00:00Z', '索引较新时用索引值')
+  assert.equal(list[1].title, '(未命名)')
+  assert.equal(list[1].cwd, '/proj/beta')
+})
+```
+
+**catalog.test.js：追加 3 个用例（C1/C2/I1 回归，共 9 个）：**
+
+```js
+test('子代理线程：payload.id 为规范 id，列表与定位都用自身 id（审查 C1）', async () => {
+  const home = await makeHome()
+  await writeSession(home, { id: 'child-own', parentId: 'parent-1', day: '2026-05-20' })
+  await writeIndex(home, [{ id: 'child-own', thread_name: '子任务', updated_at: '2026-05-20T12:00:00Z' }])
+  const list = await listSessions({ home })
+  assert.equal(list.length, 1)
+  assert.equal(list[0].id, 'child-own', '用自身 id 而非 session_id（父线程）')
+  assert.equal(list[0].title, '子任务')
+  assert.equal((await findSessionFile(home, 'child-own')).location, 'active')
+  assert.equal(await findSessionFile(home, 'parent-1'), null, '父线程 id 不应误指向子线程文件')
+})
+
+test('resume 分片：列表按 id 去重保留最新，findSessionFile 返回 mtime 最新文件（审查 C2）', async () => {
+  const home = await makeHome()
+  const p1 = await writeSession(home, { id: 'r1', day: '2026-05-20', fork: 'fork-a' })
+  await backdate(p1, Date.now() - Date.parse('2026-05-20T00:00:00Z'))
+  const p2 = await writeSession(home, { id: 'r1', day: '2026-05-21', fork: 'fork-b' })
+  await backdate(p2, Date.now() - Date.parse('2026-05-21T00:00:00Z'))
+  const list = await listSessions({ home })
+  assert.equal(list.length, 1, '同 id 去重为一条')
+  assert.equal(list[0].path, p2, '保留 mtime 最新的记录')
+  const found = await findSessionFile(home, 'r1')
+  assert.equal(found.path, p2, '定位 mtime 最新文件，不依赖 readdir 顺序')
+})
+
+test('updatedAt 取索引与 mtime 较新者；非字符串索引时间回退磁盘（审查 I1/M1）', async () => {
+  const home = await makeHome()
+  const p1 = await writeSession(home, { id: 'u1', day: '2026-05-20' })
+  await backdate(p1, Date.now() - Date.parse('2026-05-24T00:00:00Z')) // mtime 比索引新
+  const p2 = await writeSession(home, { id: 'u2', day: '2026-05-20' })
+  await backdate(p2, Date.now() - Date.parse('2026-05-22T00:00:00Z'))
+  await writeIndex(home, [
+    { id: 'u1', thread_name: '旧索引', updated_at: '2026-05-20T00:00:00Z' },
+    { id: 'u2', thread_name: '脏行', updated_at: 12345 },
+  ])
+  const list = await listSessions({ home })
+  const u1 = list.find((r) => r.id === 'u1')
+  const u2 = list.find((r) => r.id === 'u2')
+  assert.equal(u1.title, '旧索引')
+  assert.ok(u1.updatedAt.startsWith('2026-05-24'), 'mtime 比索引新 → 用 mtime')
+  assert.ok(u2.updatedAt.startsWith('2026-05-22'), '非字符串索引时间 → 回退 mtime')
+  assert.equal(list[0].id, 'u1', 'u1（05-24）排在 u2（05-22）前')
+})
+```
+
+修订后套件规模：paths 6 + reader 11 + catalog 9 = **26 tests**。
+
+**Task 8 备注（审查建议 #4，实施 Task 8 时落实）**：web 变更路由应透传 `expectedMtimeMs`（前端从 detail 的 `mtimeMs` 取得后随请求回传），否则 Task 5 的冲突防护在 web 路径上是死代码。
 
 ---
 

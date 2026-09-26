@@ -133,3 +133,12 @@ test('fastMeta: 提前 break 不泄漏 fd（stream.destroy 回收）', async () 
   const after = countFds()
   assert.ok(after - before <= 5, `fd 应保持稳定: before=${before} after=${after}`)
 })
+
+test('子代理线程：规范 id 取 payload.id（session_id 是父线程）', async () => {
+  const content = rolloutLines({ id: 'own-1', parentId: 'parent-9' })
+  assert.equal(parseSessionContent(content).id, 'own-1')
+  const home = await makeHome()
+  const p = join(home, 'sub.jsonl')
+  await writeFile(p, content)
+  assert.equal((await fastMeta(p)).id, 'own-1')
+})

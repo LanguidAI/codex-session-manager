@@ -54,7 +54,7 @@ function handleLine(line, session) {
   if (typeof line.timestamp === 'string') session.updatedAt = line.timestamp
   switch (line.type) {
     case 'session_meta':
-      session.id = p.session_id ?? p.id ?? session.id
+      session.id = p.id ?? p.session_id ?? session.id // 规范 id：payload.id 为线程自身 id；子代理线程的 session_id 是父线程（语料实测）
       session.cwd = p.cwd ?? session.cwd
       session.originator = p.originator ?? session.originator
       session.cliVersion = p.cli_version ?? session.cliVersion
@@ -155,7 +155,7 @@ export async function fastMeta(filePath, { maxLines = 200 } = {}) {
       if (line === null || typeof line !== 'object' || Array.isArray(line)) continue
       const p = line.payload ?? {}
       if (line.type === 'session_meta') {
-        meta.id = p.session_id ?? p.id ?? meta.id
+        meta.id = p.id ?? p.session_id ?? meta.id
         meta.cwd = p.cwd ?? meta.cwd
         meta.provider = p.model_provider ?? meta.provider
         meta.createdAt = p.timestamp ?? line.timestamp ?? meta.createdAt

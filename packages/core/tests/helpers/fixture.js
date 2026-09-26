@@ -10,6 +10,7 @@ export async function makeHome() {
 /** 按真实 rollout schema 生成会话文件内容。 */
 export function rolloutLines({
   id,
+  parentId,
   cwd = '/proj/alpha',
   model = 'gpt-5.5',
   provider = 'azure',
@@ -20,7 +21,7 @@ export function rolloutLines({
 }) {
   const L = (ordinal, type, payload) => JSON.stringify({ timestamp: createdAt, ordinal, type, payload })
   return [
-    L(0, 'session_meta', { session_id: id, id, timestamp: createdAt, cwd, originator: 'Codex Desktop', cli_version: '0.131.0', source: 'vscode', thread_source: 'user', model_provider: provider, base_instructions: { text: 'x'.repeat(200) } }),
+    L(0, 'session_meta', { session_id: parentId ?? id, id, timestamp: createdAt, cwd, originator: 'Codex Desktop', cli_version: '0.131.0', source: 'vscode', thread_source: 'user', model_provider: provider, base_instructions: { text: 'x'.repeat(200) } }),
     L(1, 'turn_context', { turn_id: 'turn-1', cwd, model, approval_policy: 'never' }),
     L(2, 'response_item', { type: 'message', role: 'developer', content: [{ type: 'input_text', text: '<permissions instructions> sandbox on' }] }),
     L(3, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: `# AGENTS.md instructions for ${cwd}` }] }),
@@ -31,15 +32,15 @@ export function rolloutLines({
   ].join('\n') + '\n'
 }
 
-/** 会话文件相对 CODEX_HOME 的路径（YYYY/MM/DD 目录 + rollout 文件名含 id）。 */
-export function sessionRelPath(id, day = '2026-05-20') {
+/** 会话文件相对 CODEX_HOME 的路径（YYYY/MM/DD 目录 + rollout 文件名含 id；fork 模拟 resume 分片）。 */
+export function sessionRelPath(id, day = '2026-05-20', fork) {
   const [y, m, d] = day.split('-')
-  return join('sessions', y, m, d, `rollout-${day}T00-00-00-${id}.jsonl`)
+  return join('sessions', y, m, d, `rollout-${day}T00-00-00-${id}${fork ? `_${fork}` : ''}.jsonl`)
 }
 
 /** 写入一个会话文件，返回绝对路径。 */
 export async function writeSession(home, opts) {
-  const p = join(home, sessionRelPath(opts.id, opts.day))
+  const p = join(home, sessionRelPath(opts.id, opts.day, opts.fork))
   await mkdir(dirname(p), { recursive: true })
   await writeFile(p, rolloutLines(opts))
   return p
