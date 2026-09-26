@@ -639,6 +639,322 @@ git add packages/core/tests/helpers/fixture.js packages/core/src/reader.js packa
 git commit -m "feat(core): rollout jsonl 解析器（双源用户消息去重 + fastMeta 流式头读）"
 ```
 
+### Task 3 修订（质量审查修正，后续任务以本节为准）
+
+质量审查用真实 `~/.codex` 语料（650 个 rollout 文件 / 4.8 GB，只读）实证后发现 1 个 Critical + 4 个 Important，以 fix 提交修正：
+
+1. **Critical**：`readSessionFile` 整文件 `readFile` —— 真实语料存在 1030 MB 会话（超过 Node 字符串上限，抛无 code 的 RangeError），147 MB 文件峰值 RSS 1.8 GB → 改为 **readline 流式解析**（导出名不变，下游 API 零改动）；ENOENT 转 `CsmError('not_found')` 供 web 层映射 404
+2. `null` 等**非对象 JSON 行**会让 `parseSessionContent`/`fastMeta` 抛 TypeError（违反"坏行只计数"契约）→ 类型守卫，计入 badLines / 跳过
+3. **注入前缀表不全**：真实回退模式会话中 `<recommended_plugins>` 必然泄漏（37 处），另有 `<codex_internal_context>`/`<subagent_notification>`/`<turn_aborted>` 等实测标签 → 前缀表扩充至 14 项
+4. **model 语义不一致**：`parseSessionContent` 原取最后一个 turn_context、`fastMeta` 取第一个（真实语料 2.9% 会话中途换模型，列表页与详情页会打架）→ 统一 **first-wins**（会话起始模型）
+5. **fastMeta/readSessionFile 零直接测试** → reader.test.js 从 3 个用例扩到 **9 个**（含 >64KB 超长行、maxLines 界限、null 行、updatedAt=最后时间戳、not_found）
+
+配套修订：Task 4 的 `listSessions`/`findSessionFile` 对单文件 `fastMeta`/`stat` 失败改为 **try/catch 跳过**（上文 Task 4 代码已更新）——扫描期间文件可能被 Codex 删除/移动。
+
+语料实测事实（供后续任务参考，勿再重复测量）：fastMeta 全库扫描 650 文件/4.8 GB 仅 1.37 s（Task 4 无需缓存）；消息顺序 = 文件顺序且时间戳单调（export/resume 可信赖）；47/650 会话走 response 回退源（回退分支不是死代码）。
+
+**reader.js（修订后完整实现，取代上文 Step 4）：**
+
+```js
+import { createReadStream } from 'node:fs'
+import { createInterface } from 'node:readline'
+import { CsmError } from './errors.js'
+
+/**
+ * response_item user 消息中属于上下文注入的前缀（非真实用户输入）。
+ * 列表来自真实语料采样，审查后扩充至实测出现过的全部注入标签。
+ */
+const USER_INJECTION_PREFIXES = [
+  '# AGENTS.md instructions',
+  '<permissions',
+  '<user_instructions',
+  '<environment_context',
+  '<recommended_plugins',
+  '<codex_internal_context',
+  '<subagent_notification',
+  '<turn_aborted',
+  '<codex_delegation',
+  '<realtime_delegation',
+  '<skill',
+  '<server',
+  '<repository',
+  '<image',
+]
+
+function contentText(content) {
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((c) => (typeof c?.text === 'string' ? c.text : ''))
+    .filter((t) => t !== '')
+    .join('\n')
+    .trim()
+}
+
+/** 空 Session 记录。契约：title 恒为 null（由 catalog 从 session_index 合并）；tokens=null 表示无 token_count 事件（区别于 0）。 */
+function emptySession() {
+  return {
+    id: null, title: null, cwd: null, originator: null, cliVersion: null,
+    provider: null, model: null, createdAt: null, updatedAt: null,
+    messages: [], toolCalls: [], tokens: null, badLines: 0,
+  }
+}
+
+/**
+ * 把一行已解析的 jsonl 折叠进 session 记录。
+ * 非对象行（null/标量）计入 badLines；model 取第一个 turn_context（与 fastMeta 语义一致）。
+ */
+function handleLine(line, session) {
+  if (line === null || typeof line !== 'object') {
+    session.badLines += 1
+    return
+  }
+  const p = line.payload ?? {}
+  if (typeof line.timestamp === 'string') session.updatedAt = line.timestamp
+  switch (line.type) {
+    case 'session_meta':
+      session.id = p.session_id ?? p.id ?? session.id
+      session.cwd = p.cwd ?? session.cwd
+      session.originator = p.originator ?? session.originator
+      session.cliVersion = p.cli_version ?? session.cliVersion
+      session.provider = p.model_provider ?? session.provider
+      session.createdAt = p.timestamp ?? line.timestamp ?? session.createdAt
+      break
+    case 'turn_context':
+      if (session.model === null && typeof p.model === 'string') session.model = p.model
+      break
+    case 'response_item':
+      if (p.type === 'message' && p.role === 'assistant') {
+        const text = contentText(p.content)
+        if (text) session.messages.push({ role: 'assistant', text, timestamp: line.timestamp ?? null })
+      } else if (p.type === 'message' && p.role === 'user') {
+        const text = contentText(p.content)
+        if (text && !USER_INJECTION_PREFIXES.some((pre) => text.startsWith(pre))) {
+          session.messages.push({ role: 'user', text, timestamp: line.timestamp ?? null, source: 'response' })
+        }
+      } else if (p.type === 'function_call' || p.type === 'custom_tool_call') {
+        if (typeof p.name === 'string') session.toolCalls.push(p.name)
+      }
+      break
+    case 'event_msg':
+      if (p.type === 'item_completed' && p.item?.type === 'UserMessage') {
+        const text = contentText(p.item?.content)
+        if (text) session.messages.push({ role: 'user', text, timestamp: line.timestamp ?? null, source: 'item' })
+      } else if (p.type === 'token_count') {
+        const total = p.info?.total_token_usage?.total_tokens
+        if (typeof total === 'number') session.tokens = total
+      }
+      break
+  }
+}
+
+/** 双源去重：item_completed 是权威用户消息源，存在时丢弃 response_item 回退源；随后清理内部 source 标记。 */
+function finalizeSession(session) {
+  if (session.messages.some((m) => m.source === 'item')) {
+    session.messages = session.messages.filter((m) => m.source !== 'response')
+  }
+  for (const m of session.messages) delete m.source
+  return session
+}
+
+/**
+ * 解析整个 rollout jsonl 字符串为 Session 记录；坏行只计数不报错。
+ * 消息顺序 = 文件顺序（真实语料验证时间戳单调，export/resume 可信赖）。
+ */
+export function parseSessionContent(content) {
+  const session = emptySession()
+  for (const raw of content.split('\n')) {
+    if (!raw.trim()) continue
+    let line
+    try { line = JSON.parse(raw) } catch { session.badLines += 1; continue }
+    handleLine(line, session)
+  }
+  return finalizeSession(session)
+}
+
+/**
+ * 读取并解析磁盘上的会话文件：readline 流式（GB 级大文件安全，绝不字节截断）。
+ * ENOENT 转 CsmError('not_found')，供上层映射 404。
+ */
+export async function readSessionFile(filePath) {
+  const session = emptySession()
+  const rl = createInterface({ input: createReadStream(filePath, { encoding: 'utf8' }), crlfDelay: Infinity })
+  try {
+    for await (const raw of rl) {
+      if (!raw.trim()) continue
+      let line
+      try { line = JSON.parse(raw) } catch { session.badLines += 1; continue }
+      handleLine(line, session)
+    }
+  } catch (e) {
+    if (e?.code === 'ENOENT') throw new CsmError('not_found', `session file not found: ${filePath}`)
+    throw e
+  } finally {
+    rl.close()
+  }
+  return finalizeSession(session)
+}
+
+/**
+ * 只读文件头部若干行提取列表页所需的轻量元数据。
+ * readline 逐行流式读（超长行不字节截断）；扫到 id+model 即停。
+ * model 可能为 null：maxLines 界限内未出现 turn_context。
+ */
+export async function fastMeta(filePath, { maxLines = 200 } = {}) {
+  const meta = { id: null, cwd: null, provider: null, model: null, createdAt: null }
+  const rl = createInterface({ input: createReadStream(filePath, { encoding: 'utf8' }), crlfDelay: Infinity })
+  let scanned = 0
+  try {
+    for await (const raw of rl) {
+      if (++scanned > maxLines) break
+      if (!raw.trim()) continue
+      let line
+      try { line = JSON.parse(raw) } catch { continue }
+      if (line === null || typeof line !== 'object') continue
+      const p = line.payload ?? {}
+      if (line.type === 'session_meta') {
+        meta.id = p.session_id ?? p.id ?? meta.id
+        meta.cwd = p.cwd ?? meta.cwd
+        meta.provider = p.model_provider ?? meta.provider
+        meta.createdAt = p.timestamp ?? line.timestamp ?? meta.createdAt
+      } else if (line.type === 'turn_context' && meta.model === null && typeof p.model === 'string') {
+        meta.model = p.model
+      }
+      if (meta.id !== null && meta.model !== null) break
+    }
+  } finally {
+    rl.close()
+  }
+  return meta
+}
+```
+
+**reader.test.js（修订后完整测试，取代上文 Step 2，共 9 个用例）：**
+
+```js
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { fastMeta, parseSessionContent, readSessionFile } from '../src/reader.js'
+import { makeHome, rolloutLines } from './helpers/fixture.js'
+
+test('解析 meta/model/消息/工具/tokens', () => {
+  const s = parseSessionContent(rolloutLines({ id: 'sid-1', cwd: '/proj/x', model: 'gpt-5.5', provider: 'azure', userText: '目标A', assistantText: '完成A', tokens: 99 }))
+  assert.equal(s.id, 'sid-1')
+  assert.equal(s.cwd, '/proj/x')
+  assert.equal(s.model, 'gpt-5.5')
+  assert.equal(s.provider, 'azure')
+  assert.equal(s.tokens, 99)
+  assert.equal(s.badLines, 0)
+  const users = s.messages.filter((m) => m.role === 'user')
+  assert.equal(users.length, 1, 'item_completed 用户消息生效，注入与 response_item 重复项被去掉')
+  assert.equal(users[0].text, '目标A')
+  assert.equal(s.messages.find((m) => m.role === 'assistant').text, '完成A')
+  assert.deepEqual(s.toolCalls, ['exec_command'])
+})
+
+test('无 item_completed 时回退 response_item user 并过滤注入', () => {
+  const lines = [
+    JSON.stringify({ timestamp: 't', ordinal: 0, type: 'session_meta', payload: { session_id: 's2', id: 's2', cwd: '/p' } }),
+    JSON.stringify({ timestamp: 't', ordinal: 1, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '# AGENTS.md instructions for /p' }] } }),
+    JSON.stringify({ timestamp: 't', ordinal: 2, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '真正的问题' }] } }),
+  ].join('\n')
+  const s = parseSessionContent(lines)
+  assert.equal(s.messages.length, 1)
+  assert.equal(s.messages[0].text, '真正的问题')
+})
+
+test('坏行计数不致命', () => {
+  const s = parseSessionContent('not json\n' + rolloutLines({ id: 's3' }))
+  assert.equal(s.badLines, 1)
+  assert.equal(s.id, 's3')
+})
+
+test('扩充注入前缀：<recommended_plugins 等在回退模式被过滤', () => {
+  const U = (ordinal, text) => JSON.stringify({ timestamp: 't', ordinal, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } })
+  const lines = [
+    JSON.stringify({ timestamp: 't', ordinal: 0, type: 'session_meta', payload: { session_id: 's4', id: 's4', cwd: '/p' } }),
+    U(1, '<recommended_plugins> 试试这些插件'),
+    U(2, '<turn_aborted> 已取消'),
+    U(3, '<codex_internal_context source="goal"> 内部目标'),
+    U(4, '接下来做什么'),
+  ].join('\n')
+  const s = parseSessionContent(lines)
+  assert.equal(s.messages.length, 1)
+  assert.equal(s.messages[0].text, '接下来做什么')
+})
+
+test('model 语义一致：parseSessionContent 与 fastMeta 均取第一个 turn_context', async () => {
+  const home = await makeHome()
+  const content = [
+    JSON.stringify({ timestamp: 't1', ordinal: 0, type: 'session_meta', payload: { session_id: 'm1', id: 'm1', cwd: '/p' } }),
+    JSON.stringify({ timestamp: 't2', ordinal: 1, type: 'turn_context', payload: { model: 'gpt-5.5' } }),
+    JSON.stringify({ timestamp: 't3', ordinal: 2, type: 'turn_context', payload: { model: 'gpt-5.6-codex' } }),
+  ].join('\n') + '\n'
+  assert.equal(parseSessionContent(content).model, 'gpt-5.5')
+  const p = join(home, 'two-models.jsonl')
+  await writeFile(p, content)
+  assert.equal((await fastMeta(p)).model, 'gpt-5.5')
+})
+
+test('非对象 JSON 行（null/标量）计入 badLines 且不崩溃', async () => {
+  const s = parseSessionContent('null\n123\n"str"\ntrue\n' + rolloutLines({ id: 's5' }))
+  assert.equal(s.badLines, 4)
+  assert.equal(s.id, 's5')
+  const home = await makeHome()
+  const p = join(home, 'nulls.jsonl')
+  await writeFile(p, 'null\n' + rolloutLines({ id: 's6' }))
+  assert.equal((await fastMeta(p)).id, 's6', 'fastMeta 跳过 null 行不抛错')
+})
+
+test('fastMeta: turn_context 缺失或超出 maxLines 时 model 为 null；maxLines 可覆盖', async () => {
+  const home = await makeHome()
+  const noTc = join(home, 'no-tc.jsonl')
+  await writeFile(noTc, JSON.stringify({ timestamp: 't', ordinal: 0, type: 'session_meta', payload: { session_id: 'f1', id: 'f1', cwd: '/p', model_provider: 'azure' } }) + '\n')
+  assert.equal((await fastMeta(noTc)).model, null)
+  const lateTc = join(home, 'late-tc.jsonl')
+  const lines = [JSON.stringify({ timestamp: 't', ordinal: 0, type: 'session_meta', payload: { session_id: 'f2', id: 'f2', cwd: '/p' } })]
+  for (let i = 1; i <= 250; i++) lines.push(JSON.stringify({ timestamp: 't', ordinal: i, type: 'event_msg', payload: { type: 'task_started' } }))
+  lines.push(JSON.stringify({ timestamp: 't', ordinal: 251, type: 'turn_context', payload: { model: 'gpt-9' } }))
+  await writeFile(lateTc, lines.join('\n') + '\n')
+  assert.equal((await fastMeta(lateTc)).model, null, '默认 200 行界限内找不到')
+  assert.equal((await fastMeta(lateTc, { maxLines: 300 })).model, 'gpt-9')
+})
+
+test('fastMeta: 超长单行（>64KB）不截断', async () => {
+  const home = await makeHome()
+  const p = join(home, 'big-meta.jsonl')
+  const content = JSON.stringify({ timestamp: 't', ordinal: 0, type: 'session_meta', payload: { session_id: 'big1', id: 'big1', cwd: '/p', model_provider: 'azure', base_instructions: { text: 'x'.repeat(100_000) } } })
+    + '\n' + JSON.stringify({ timestamp: 't', ordinal: 1, type: 'turn_context', payload: { model: 'gpt-5.5' } }) + '\n'
+  await writeFile(p, content)
+  const meta = await fastMeta(p)
+  assert.equal(meta.id, 'big1')
+  assert.equal(meta.model, 'gpt-5.5')
+})
+
+test('readSessionFile: 流式解析、updatedAt=最后时间戳、文件不存在抛 not_found', async () => {
+  const home = await makeHome()
+  const p = join(home, 'detail.jsonl')
+  const content = [
+    JSON.stringify({ timestamp: '2026-05-20T12:00:00.000Z', ordinal: 0, type: 'session_meta', payload: { session_id: 'd1', id: 'd1', cwd: '/proj/d', originator: 'Codex Desktop', cli_version: '0.131.0', model_provider: 'azure' } }),
+    JSON.stringify({ timestamp: '2026-05-20T12:00:01.000Z', ordinal: 1, type: 'turn_context', payload: { model: 'gpt-5.5' } }),
+    JSON.stringify({ timestamp: '2026-05-20T12:00:02.000Z', ordinal: 2, type: 'event_msg', payload: { type: 'item_completed', item: { type: 'UserMessage', content: [{ type: 'text', text: '第一问' }] } } }),
+    JSON.stringify({ timestamp: '2026-05-20T12:05:00.000Z', ordinal: 3, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 77 } } } }),
+  ].join('\n') + '\n'
+  await writeFile(p, content)
+  const s = await readSessionFile(p)
+  assert.equal(s.id, 'd1')
+  assert.equal(s.originator, 'Codex Desktop')
+  assert.equal(s.cliVersion, '0.131.0')
+  assert.equal(s.createdAt, '2026-05-20T12:00:00.000Z')
+  assert.equal(s.updatedAt, '2026-05-20T12:05:00.000Z')
+  assert.equal(s.tokens, 77)
+  assert.equal(s.messages.length, 1)
+  assert.equal(s.messages[0].text, '第一问')
+  await assert.rejects(() => readSessionFile(join(home, 'missing.jsonl')), (e) => e.code === 'not_found')
+})
+```
+
 ---
 
 ### Task 4: core — catalog（索引合并 + 列表 + 定位）
@@ -789,9 +1105,14 @@ export async function listSessions({ home, q, cwd, model, includeArchived = fals
   const out = []
   for (const [dir, archived] of dirs) {
     for await (const p of walkJsonl(dir)) {
-      const meta = await fastMeta(p)
+      // 单文件读取失败（扫描期间被 Codex 删除/权限/符号链接环等）跳过，不打断整个列表（审查修订）
+      let meta
+      let st
+      try {
+        meta = await fastMeta(p)
+        st = await stat(p)
+      } catch { continue }
       if (!meta.id) continue
-      const st = await stat(p)
       const idx = index.get(meta.id)
       const rec = {
         id: meta.id,
@@ -824,10 +1145,13 @@ export async function findSessionFile(home, id) {
   for (const [dir, location] of [[l.sessionsDir, 'active'], [l.archivedDir, 'archived'], [l.trashDir, 'trash']]) {
     for await (const p of walkJsonl(dir)) {
       if (!basename(p).includes(id)) continue
-      const meta = await fastMeta(p)
-      if (meta.id !== id) continue
-      const st = await stat(p)
-      return { path: p, location, mtimeMs: st.mtimeMs, size: st.size }
+      // 单文件读取失败跳过继续找（审查修订）
+      try {
+        const meta = await fastMeta(p)
+        if (meta.id !== id) continue
+        const st = await stat(p)
+        return { path: p, location, mtimeMs: st.mtimeMs, size: st.size }
+      } catch { continue }
     }
   }
   return null
