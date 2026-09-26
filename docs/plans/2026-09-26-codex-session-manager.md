@@ -3445,32 +3445,67 @@ const wrap = (fn) => async (args) => {
   try { return ok(await fn(args)) } catch (err) { return fail(err) }
 }
 
-server.tool('list_sessions', '列出/搜索 Codex 历史会话（id、标题、项目、模型、时间）。', {
-  query: z.string().optional().describe('关键字（标题/ID/目录）'),
-  cwd: z.string().optional().describe('项目目录过滤（包含匹配）'),
-  model: z.string().optional().describe('模型过滤（精确匹配）'),
+// registerTool 是 SDK 1.30.1 的现代 API（server.tool 全部 overload 已标 @deprecated）；
+// annotations 向客户端传达只读/破坏性语义（delete=destructive），description 内嵌 M-2/M-4 操作指引（tools/list 即对模型可见）。
+server.registerTool('list_sessions', {
+  title: '列出/搜索会话',
+  description: '列出/搜索 Codex 历史会话（返回 id、标题、项目 cwd、模型、更新时间）。仅列活跃会话——归档/删除后不再出现（按 id 仍可操作，见 SKILL.md）。大语料下响应可达上百 KB，务必用 query/cwd/model 过滤。',
+  inputSchema: {
+    query: z.string().optional().describe('关键字（标题/ID/目录，包含匹配）'),
+    cwd: z.string().optional().describe('项目目录过滤（包含匹配）'),
+    model: z.string().optional().describe('模型过滤（精确匹配）'),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, wrap(tools.list_sessions))
 
-server.tool('get_session', '读取一个会话的完整内容（消息流、工具调用统计、tokens）。', {
-  id: z.string().describe('会话 ID'),
+server.registerTool('get_session', {
+  title: '读取会话全文',
+  description: '读取一个会话的完整内容（消息流、toolCallCounts、tokens、badLines）。大会话输出最坏可达 ~0.7MB（数十万 tokens）——若只为回顾/迁移，优先用 export_session 落地文件再按需读片段，别把全文灌进上下文。',
+  inputSchema: {
+    id: z.string().describe('会话 ID'),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, wrap(tools.get_session))
 
-server.tool('rename_session', '重命名会话（更新标题索引，自动备份，不移动会话文件）。', {
-  id: z.string(), title: z.string().describe('新标题'),
+server.registerTool('rename_session', {
+  title: '重命名会话',
+  description: '重命名会话：只更新标题索引 session_index.jsonl（自动备份），绝不移动或改写会话 jsonl 本体。标题上限 200 字符。',
+  inputSchema: {
+    id: z.string().describe('会话 ID'),
+    title: z.string().max(200).describe('新标题（≤200 字符）'),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, wrap(tools.rename_session))
 
-server.tool('archive_session', '归档会话：移入官方 archived_sessions/ 目录（可逆，自动备份）。', {
-  id: z.string(), force: z.boolean().optional().describe('会话 30 秒内仍被写入时强制'),
+server.registerTool('archive_session', {
+  title: '归档会话',
+  description: '归档会话：移入官方 archived_sessions/（可逆，自动备份）。归档后从 list_sessions 消失，但按显式 id 仍可 get/rename/export；无 restore 工具（需手动移回 sessions/）。30 秒内仍被写入的会话会被拒（code=active），除非 force。',
+  inputSchema: {
+    id: z.string().describe('会话 ID'),
+    force: z.boolean().optional().describe('会话 30 秒内仍被写入时强制执行'),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
 }, wrap(tools.archive_session))
 
-server.tool('delete_session', '删除会话（软删除：先备份，再移入 .csm-trash/，不物理删除）。', {
-  id: z.string(), force: z.boolean().optional(),
+server.registerTool('delete_session', {
+  title: '软删除会话',
+  description: '软删除会话：先备份，再移入 .csm-trash/，绝不物理删除（可手动找回）。删除后从 list_sessions 消失，但按显式 id 仍可操作；无 restore 工具。30 秒内活跃写入会被拒（code=active），除非 force。',
+  inputSchema: {
+    id: z.string().describe('会话 ID'),
+    force: z.boolean().optional().describe('会话 30 秒内仍被写入时强制执行'),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
 }, wrap(tools.delete_session))
 
-server.tool('export_session', '导出会话为 Markdown 或 JSON 文件，返回文件路径。', {
-  id: z.string(),
-  format: z.enum(['md', 'json']).optional().describe('默认 md'),
-  outputPath: z.string().optional().describe('绝对路径；缺省写到 CODEX_HOME/exports/'),
+server.registerTool('export_session', {
+  title: '导出会话',
+  description: '导出会话为 Markdown 或 JSON 文件，返回 {path, bytes}。缺省写 CODEX_HOME/exports/<id>.<format>；outputPath 锚定在 CODEX_HOME 内（外部绝对路径拒绝）。安全：绝不覆盖 exports/ 之外的既有文件（命中 → code=conflict）；exports/ 内同名文件允许幂等重导。',
+  inputSchema: {
+    id: z.string().describe('会话 ID'),
+    format: z.enum(['md', 'json']).optional().describe('导出格式，默认 md'),
+    outputPath: z.string().optional().describe('输出路径（锚定 CODEX_HOME 内）；缺省 CODEX_HOME/exports/<id>.<format>'),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, wrap(tools.export_session))
 
 await server.connect(new StdioServerTransport())
@@ -3550,12 +3585,35 @@ description: 管理 Codex 历史会话——查询/搜索会话列表、读取�
 - 所有写操作自动备份到 ~/.codex/.csm-backups/
 - delete 是移入回收站，可手动找回
 - 绝不修改会话 jsonl 内容本身，重命名只写标题索引
+
+## 体积与性能（务必遵守）
+- `list_sessions` 在大语料下响应可达上百 KB：**永远先用 `query`/`cwd`/`model` 过滤**，不要无过滤地全量拉取。
+- `get_session` 返回完整消息流，长会话最坏可达 ~0.7MB（数十万 tokens）：回顾或迁移长会话时**优先 `export_session` 落地成文件**再按需读取片段，别把全文直接灌进上下文。
+
+## 归档/删除后的可见性（务必向用户说明）
+- `list_sessions` **只列活跃会话**：一旦 `archive_session`/`delete_session`，会话即**从列表消失**，且**没有任何 MCP 工具能重新列出归档区/回收站里的会话**。
+- 但只要还记得 **id**，仍可对它调 `get_session`/`rename_session`/`export_session`（id 可在归档/删除前从列表记下，或从导出文件里查）。
+- **没有 restore/undelete 工具**：归档=移入 `archived_sessions/`、删除=移入 `.csm-trash/`（都先自动备份到 `.csm-backups/`）；如需恢复，请手动把对应 jsonl 移回 `sessions/`。
+- 注：`get_session` 返回的 `archived` 字段对"已归档"与"在回收站"都为 `true`（v0.1 不区分二者）。
 ```
 
 **Step 5: 冒烟验证 MCP server 能启动**
 
-Run: `cd /Users/xuxianxian/Documents/test/codex-session-manager && echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' | CODEX_HOME=/tmp/csm-smoke node packages/plugin/server.mjs 2>/dev/null | head -c 300`
-Expected: 输出一段 JSON-RPC 响应（含 `"serverInfo"` 与 `session-manager`），进程正常退出
+Run:
+```bash
+cd /Users/xuxianxian/Documents/test/codex-session-manager
+printf '%s\n' \
+'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+'{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+| CODEX_HOME=/tmp/csm-smoke node packages/plugin/server.mjs 2>/dev/null > /tmp/csm-smoke-out.jsonl
+echo "node 退出码=$?（stdin EOF 后应为 0，非挂起）"
+grep -q 'session-manager' /tmp/csm-smoke-out.jsonl && echo "✓ initialize 响应含 serverInfo name=session-manager" || echo "✗ 无 serverInfo"
+n=0; for t in list_sessions get_session rename_session archive_session delete_session export_session; do grep -q "\"name\":\"$t\"" /tmp/csm-smoke-out.jsonl && n=$((n+1)) || echo "✗ 缺工具 $t"; done; echo "✓ 已注册工具数=$n/6"
+grep -q '"destructiveHint":true' /tmp/csm-smoke-out.jsonl && echo "✓ delete_session 的 destructiveHint:true 上线（annotations 生效）" || echo "✗ 无 destructiveHint"
+rm -f /tmp/csm-smoke-out.jsonl
+```
+Expected: `node 退出码=0`（进程在 stdin EOF 后正常退出、不挂起）；`✓ serverInfo name=session-manager`；`✓ 已注册工具数=6/6`；`✓ destructiveHint:true 上线`。（控制器已用同款最小 server 探针实证：registerTool+annotations 正确上线 tools/list、raw-shape inputSchema 生效、stdin EOF→exit 0、protocolVersion 2024-11-05 被接受，故此冒烟不会挂起、无需 timeout。）
 
 **Step 6: Commit**
 
@@ -3563,6 +3621,19 @@ Expected: 输出一段 JSON-RPC 响应（含 `"serverInfo"` 与 `session-manager
 git add packages/plugin/server.mjs packages/plugin/.codex-plugin packages/plugin/.mcp.json packages/plugin/skills
 git commit -m "feat(plugin): MCP server 接线、插件清单与 session-manager SKILL.md"
 ```
+
+> **Task 11 预审修订（2026-09-27，控制器对照已装 @modelcontextprotocol/sdk 1.30.1 + zod 3.25.76 + mcp-builder 技能 + 设计文档，派发前修订；amendments 以 docs(plan) 单独提交后再派 implementer）**
+>
+> **修订 1 — `server.tool` → `registerTool`（废弃 API 修正）**：计划初稿用 `server.tool(name, desc, schema, cb)` 注册 6 工具。对照已装 SDK 1.30.1 的 `mcp.d.ts`（L110–146）发现 **`tool()` 全部 6 个 overload 均标 `@deprecated Use registerTool instead`**；mcp-builder 技能亦明令「DO use `registerTool` / DO NOT use `server.tool()`」。已改为现代 API `registerTool(name, {title, description, inputSchema, annotations}, cb)`。**控制器已实证**（同款结构最小 server 探针，跑完即删、树净）：registerTool 注册成功、annotations 正确上线 tools/list、raw-shape `inputSchema`（`{q:z.string().optional()}`）生效、**stdin EOF 后进程 exit 0（Step 5 冒烟不挂起）**、protocolVersion `2024-11-05` 被接受、initialize 响应 serverInfo 含 name/version。
+> **修订 2 — annotations（安全语义上线）**：每工具加 ToolAnnotations，向客户端/模型传达只读/破坏性语义（便于对破坏性工具做审批门控）：`list_sessions`/`get_session`=`readOnlyHint:true`；`rename`/`archive`/`export`=`readOnlyHint:false, destructiveHint:false`；**`delete_session`=`destructiveHint:true`**；`idempotentHint`：读类+rename+export=true、archive/delete=false（二次调用会 already-archived/trashed→invalid）；全部 `openWorldHint:false`（操作本地语料、封闭世界）。
+> **修订 3 — M-2/M-4 延后项落实（Task 10 质量审查明确要求 SKILL.md 承载）**：(a) **工具 description 内嵌**（tools/list 即对模型可见，无需先加载技能）：list_sessions「大语料响应可达上百 KB，务必用 query/cwd/model 过滤」+「仅列活跃会话」；get_session「大会话最坏 ~0.7MB，回顾/迁移优先 export_session 落地文件」；archive/delete「之后从 list 消失、按 id 仍可操作、无 restore 工具」。(b) **SKILL.md 新增两专节**：「体积与性能」（M-4）+「归档/删除后的可见性」（M-2：从 list 消失、无工具可重列归档/回收站、按 id 仍可 get/rename/export、无 restore/undelete 需手动移回、get_session 的 `archived` 字段对已归档与在回收站都为 true 不区分）。
+> **修订 4 — rename 标题 zod `.max(200)`（双保险）**：`title: z.string().max(200)` 与 Task 10 tools.js 的 `MAX_TITLE=200` 封顶形成两层——zod 层在 handler 前即拒 >200（SDK 返回校验错误，不经 wrap），tools.js 层兜底且已被 Task 10 测试直接覆盖（该测试直调 `tools.rename_session`、绕过 zod，故两层不冲突、各有验证）。
+> **修订 5 — Step 5 冒烟增强**：原版只发 initialize（无法验证工具是否真注册）。改为发 initialize + `notifications/initialized` + tools/list，断言 serverInfo name=session-manager、**6/6 工具注册**、delete_session 的 `destructiveHint:true` 上线、node 退出码=0（EOF 退出、非挂起）。
+>
+> **已核实无需改**：import 路径 `@modelcontextprotocol/sdk/server/mcp.js`、`.../server/stdio.js` 经 exports `./*` 通配解析（→ `dist/esm/server/{mcp,stdio}.js`，两文件实存）；zod 3.25.76 标准 API（`.optional()/.describe()/.max()/.enum()/.boolean()`）；`ok/fail/wrap`（领域错误→isError 结果而非协议异常）模式正确——wrap 只捕 handler 内错误，zod 校验错误由 SDK 自行返回（预期行为）。**Task 11 不新增单元测试**（server.mjs 是 stdio 接线层；6 工具的输入/输出契约已由 Task 10 的 tools.test.js 进程内测 4 个覆盖，符合设计文档 L137「进程内直调、不经 stdio」），验证靠 Step 5 冒烟 + Task 13 真实安装；**全套测试维持 70/70**。
+>
+> **清单 schema 暂定、Task 13 真实安装为权威校验点**：`plugin.json` / `.mcp.json` 字段取自设计文档（L32–33、L60–64）+ Codex 惯例。联网核实**部分成功**：`PluginMcpServerConfig` 确存在于 openai/codex `codex-rs/core/config.schema.json`、`default_tools_approval_mode` 确为真实 Codex 字段（GitHub issue #29857 标题佐证）；但字段级完整 schema 未能核验（网络不稳：developers.openai.com 返 403、raw config.schema.json 30s 超时）。→ **Task 13（装入真实 Codex Desktop 验证插件加载、工具出现）是清单的权威校验**；在此之前清单按暂定处理，若 Task 13 发现字段出入（如 `mcpServers` vs `mcp_servers`、interface 块字段名、approval_mode 取值）就在 Task 13 修正。`.mcp.json` 模板的 `{{PLUGIN_REPO_DIR}}` 占位符由 Task 12 install.mjs 用绝对路径重写。
+> **SKILL.md 放置 — 设计↔计划不一致（取计划）**：设计文档目录树（L63）画 `plugin/SKILL.md`（顶层），计划放 `plugin/skills/session-manager/SKILL.md`——后者与 plugin.json 的 `"skills":"./skills/"` 引用 + Codex 技能惯例（`skills/<name>/SKILL.md`）自洽，设计文档树是简化画法。**保留计划放置**；Task 13 可顺带把设计文档树更新一致（非必须）。
 
 ---
 
