@@ -46,7 +46,7 @@ function emptySession() {
  * 非对象行（null/标量）计入 badLines；model 取第一个 turn_context（与 fastMeta 语义一致）。
  */
 function handleLine(line, session) {
-  if (line === null || typeof line !== 'object') {
+  if (line === null || typeof line !== 'object' || Array.isArray(line)) {
     session.badLines += 1
     return
   }
@@ -143,7 +143,8 @@ export async function readSessionFile(filePath) {
  */
 export async function fastMeta(filePath, { maxLines = 200 } = {}) {
   const meta = { id: null, cwd: null, provider: null, model: null, createdAt: null }
-  const rl = createInterface({ input: createReadStream(filePath, { encoding: 'utf8' }), crlfDelay: Infinity })
+  const stream = createReadStream(filePath, { encoding: 'utf8' })
+  const rl = createInterface({ input: stream, crlfDelay: Infinity })
   let scanned = 0
   try {
     for await (const raw of rl) {
@@ -151,7 +152,7 @@ export async function fastMeta(filePath, { maxLines = 200 } = {}) {
       if (!raw.trim()) continue
       let line
       try { line = JSON.parse(raw) } catch { continue }
-      if (line === null || typeof line !== 'object') continue
+      if (line === null || typeof line !== 'object' || Array.isArray(line)) continue
       const p = line.payload ?? {}
       if (line.type === 'session_meta') {
         meta.id = p.session_id ?? p.id ?? meta.id
@@ -165,6 +166,7 @@ export async function fastMeta(filePath, { maxLines = 200 } = {}) {
     }
   } finally {
     rl.close()
+    stream.destroy() // 回收提前 break 路径的 fd（rl.close 不销毁输入流）
   }
   return meta
 }

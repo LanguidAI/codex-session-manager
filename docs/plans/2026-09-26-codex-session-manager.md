@@ -955,13 +955,80 @@ test('readSessionFile: 流式解析、updatedAt=最后时间戳、文件不存�
 })
 ```
 
+**Task 3 复审遗留条件（在 Task 4 Step 0 落地）**：复审实测发现 `fastMeta` 提前 break（找齐 id+model / maxLines 界限）时每次调用泄漏 1 个 fd——`rl.close()` 不销毁底层输入流；800 次调用泄漏 800 fd，常见 `ulimit -n 256/1024` 下 Task 4 全库扫描会 EMFILE，且 try/catch 容错会**静默吞掉**该错误导致列表缺会话。修复方案（已在 /tmp 复本验证 fd 持平）：`fastMeta` 持有 `stream` 引用，`finally` 中 `rl.close()` 后补 `stream.destroy()`；顺带把**数组行**计入坏行（`Array.isArray` 守卫）。reader.test.js 增加 fd 稳定回归测试（第 10 用例）。`readSessionFile` 全量读到 EOF、流自动关闭，实测不泄漏，不改。
+
 ---
 
 ### Task 4: core — catalog（索引合并 + 列表 + 定位）
 
 **Files:**
+- Modify: `packages/core/src/reader.js`（Step 0 遗留条件）
+- Modify: `packages/core/tests/reader.test.js`（Step 0 回归测试）
 - Create: `packages/core/src/catalog.js`
 - Test: `packages/core/tests/catalog.test.js`
+
+**Step 0（Task 3 复审遗留条件：fastMeta fd 泄漏修复，先于本任务其余步骤完成）**
+
+`reader.js` 的 `fastMeta` 替换为（持有 stream 引用 + finally destroy；数组行跳过）：
+
+```js
+/**
+ * 只读文件头部若干行提取列表页所需的轻量元数据。
+ * readline 逐行流式读（超长行不字节截断）；扫到 id+model 即停。
+ * model 可能为 null：maxLines 界限内未出现 turn_context。
+ */
+export async function fastMeta(filePath, { maxLines = 200 } = {}) {
+  const meta = { id: null, cwd: null, provider: null, model: null, createdAt: null }
+  const stream = createReadStream(filePath, { encoding: 'utf8' })
+  const rl = createInterface({ input: stream, crlfDelay: Infinity })
+  let scanned = 0
+  try {
+    for await (const raw of rl) {
+      if (++scanned > maxLines) break
+      if (!raw.trim()) continue
+      let line
+      try { line = JSON.parse(raw) } catch { continue }
+      if (line === null || typeof line !== 'object' || Array.isArray(line)) continue
+      const p = line.payload ?? {}
+      if (line.type === 'session_meta') {
+        meta.id = p.session_id ?? p.id ?? meta.id
+        meta.cwd = p.cwd ?? meta.cwd
+        meta.provider = p.model_provider ?? meta.provider
+        meta.createdAt = p.timestamp ?? line.timestamp ?? meta.createdAt
+      } else if (line.type === 'turn_context' && meta.model === null && typeof p.model === 'string') {
+        meta.model = p.model
+      }
+      if (meta.id !== null && meta.model !== null) break
+    }
+  } finally {
+    rl.close()
+    stream.destroy() // 回收提前 break 路径的 fd（rl.close 不销毁输入流）
+  }
+  return meta
+}
+```
+
+同文件 `handleLine` 的守卫改为：`if (line === null || typeof line !== 'object' || Array.isArray(line)) {`（数组行计入 badLines）。
+
+`reader.test.js` 两处修改：
+1. 原「非对象 JSON 行」用例改名并扩充——输入 `'null\n123\n"str"\ntrue\n[]\n' + rolloutLines({ id: 's5' })`，断言 `badLines` 为 **5**，用例名改为 `'非对象 JSON 行（null/标量/数组）计入 badLines 且不崩溃'`
+2. 文件顶部增加 `import { readdirSync } from 'node:fs'`，末尾追加第 10 个用例：
+
+```js
+test('fastMeta: 提前 break 不泄漏 fd（stream.destroy 回收）', async () => {
+  const home = await makeHome()
+  const p = join(home, 'fd.jsonl')
+  await writeFile(p, rolloutLines({ id: 'fd1' }))
+  const countFds = () => readdirSync('/dev/fd').length
+  const before = countFds()
+  for (let i = 0; i < 200; i++) await fastMeta(p) // 找齐 id+model 提前退出
+  for (let i = 0; i < 200; i++) await fastMeta(p, { maxLines: 1 }) // maxLines break 路径
+  const after = countFds()
+  assert.ok(after - before <= 5, `fd 应保持稳定: before=${before} after=${after}`)
+})
+```
+
+验证：`node --test "packages/core/tests/*.test.js"` → **16/16 PASS**（paths 6 + reader 10）。
 
 **Step 1: 写失败测试** `packages/core/tests/catalog.test.js`
 

@@ -4,6 +4,7 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fastMeta, parseSessionContent, readSessionFile } from '../src/reader.js'
 import { makeHome, rolloutLines } from './helpers/fixture.js'
+import { readdirSync } from 'node:fs'
 
 test('解析 meta/model/消息/工具/tokens', () => {
   const s = parseSessionContent(rolloutLines({ id: 'sid-1', cwd: '/proj/x', model: 'gpt-5.5', provider: 'azure', userText: '目标A', assistantText: '完成A', tokens: 99 }))
@@ -64,9 +65,9 @@ test('model 语义一致：parseSessionContent 与 fastMeta 均取第一个 turn
   assert.equal((await fastMeta(p)).model, 'gpt-5.5')
 })
 
-test('非对象 JSON 行（null/标量）计入 badLines 且不崩溃', async () => {
-  const s = parseSessionContent('null\n123\n"str"\ntrue\n' + rolloutLines({ id: 's5' }))
-  assert.equal(s.badLines, 4)
+test('非对象 JSON 行（null/标量/数组）计入 badLines 且不崩溃', async () => {
+  const s = parseSessionContent('null\n123\n"str"\ntrue\n[]\n' + rolloutLines({ id: 's5' }))
+  assert.equal(s.badLines, 5)
   assert.equal(s.id, 's5')
   const home = await makeHome()
   const p = join(home, 'nulls.jsonl')
@@ -119,4 +120,16 @@ test('readSessionFile: 流式解析、updatedAt=最后时间戳、文件不存�
   assert.equal(s.messages.length, 1)
   assert.equal(s.messages[0].text, '第一问')
   await assert.rejects(() => readSessionFile(join(home, 'missing.jsonl')), (e) => e.code === 'not_found')
+})
+
+test('fastMeta: 提前 break 不泄漏 fd（stream.destroy 回收）', async () => {
+  const home = await makeHome()
+  const p = join(home, 'fd.jsonl')
+  await writeFile(p, rolloutLines({ id: 'fd1' }))
+  const countFds = () => readdirSync('/dev/fd').length
+  const before = countFds()
+  for (let i = 0; i < 200; i++) await fastMeta(p) // 找齐 id+model 提前退出
+  for (let i = 0; i < 200; i++) await fastMeta(p, { maxLines: 1 }) // maxLines break 路径
+  const after = countFds()
+  assert.ok(after - before <= 5, `fd 应保持稳定: before=${before} after=${after}`)
 })
