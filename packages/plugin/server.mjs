@@ -24,20 +24,22 @@ const wrap = (fn) => async (args) => {
 // annotations 向客户端传达只读/破坏性语义（delete=destructive），description 内嵌 M-2/M-4 操作指引（tools/list 即对模型可见）。
 server.registerTool('list_sessions', {
   title: '列出/搜索会话',
-  description: '列出/搜索 Codex 历史会话（返回 id、标题、项目 cwd、模型、更新时间）。仅列活跃会话——归档/删除后不再出现（按 id 仍可操作，见 SKILL.md）。大语料下响应可达上百 KB，务必用 query/cwd/model 过滤。',
+  description: '列出/搜索 Codex 历史会话（返回 id、标题、项目 cwd、模型、更新时间）。默认只返回最近 200 条（truncated=true 表示被截断，可用 limit=0 取消限制；count 始终是匹配总数）。仅列活跃会话——归档/删除后不再出现（按 id 仍可操作，见 SKILL.md）。大语料下响应可达上百 KB，务必用 query/cwd/model 过滤。',
   inputSchema: {
     query: z.string().optional().describe('关键字（标题/ID/目录，包含匹配）'),
     cwd: z.string().optional().describe('项目目录过滤（包含匹配）'),
     model: z.string().optional().describe('模型过滤（精确匹配）'),
+    limit: z.number().int().nonnegative().optional().describe('最多返回多少条（默认 200；0 = 不限制）。按更新时间倒序保留最近的'),
   },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, wrap(tools.list_sessions))
 
 server.registerTool('get_session', {
   title: '读取会话全文',
-  description: '读取一个会话的完整内容（消息流、toolCallCounts、tokens、badLines）。大会话输出最坏可达 ~1.8MB（数万至数十万 tokens）——若只为回顾/迁移，优先用 export_session 落地文件再按需读片段，别把全文灌进上下文。',
+  description: '读取一个会话的完整内容（消息流、toolCallCounts、tokens、badLines）。默认只返回最近 200 条消息（实测真实语料中位 19 条、p90 151 条）；超出时返回 messagesTruncated=true 与 totalMessages，用 maxMessages=0 或更大的值取全量。大会话输出最坏可达 ~1.8MB（数万至数十万 tokens）——若只为回顾/迁移，优先用 export_session 落地文件再按需读片段，别把全文灌进上下文。',
   inputSchema: {
     id: z.string().describe('会话 ID'),
+    maxMessages: z.number().int().nonnegative().optional().describe('最多返回多少条消息（默认 200；0 = 不限制）。超限时保留最近的消息并置 messagesTruncated=true'),
   },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, wrap(tools.get_session))

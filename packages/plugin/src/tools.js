@@ -13,6 +13,21 @@ function countBy(arr) {
 /** 标题长度上限（I6 决策：core 不限，web/MCP 入口层封顶；镜像 web server.mjs 的 MAX_TITLE=200）。 */
 const MAX_TITLE = 200
 
+// I16：MCP 载荷体积上限。实测真实语料 700 会话的消息数分布：
+//   中位 19 / p90 151 / p95 310 / p99 899 / 最大 4228
+// → 200 条可完整覆盖约九成会话；超出则截断尾部并显式报告，避免一次 get_session 灌满上下文。
+const DEFAULT_MAX_MESSAGES = 200
+const DEFAULT_LIST_LIMIT = 200
+
+/** 非负整数校验（0 = 不限制）；非法值抛 invalid，避免负切片/字符串切片的歧义。 */
+function nonNegInt(v, name) {
+  if (v === undefined) return undefined
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+    throw new core.CsmError('invalid', `${name} must be a non-negative integer`)
+  }
+  return v
+}
+
 /** 创建 6 个 MCP 工具的实现函数（home 缺省用 CODEX_HOME）。 */
 export function createSessionTools({ home } = {}) {
   const H = home ?? core.codexHome()
@@ -28,22 +43,33 @@ export function createSessionTools({ home } = {}) {
   }
 
   return {
-    async list_sessions({ query, cwd, model } = {}) {
+    async list_sessions({ query, cwd, model, limit } = {}) {
+      const lim = nonNegInt(limit, 'limit') ?? DEFAULT_LIST_LIMIT
       const sessions = await core.listSessions({ home: H, q: query, cwd, model })
+      // core 已按 updatedAt 倒序 → 截断保留最近 N 条
+      const kept = lim === 0 ? sessions : sessions.slice(0, lim)
       return {
-        count: sessions.length,
-        sessions: sessions.map((s) => ({
+        count: sessions.length, // 保持既有语义：匹配总数（web/测试依赖）
+        returned: kept.length,
+        truncated: kept.length < sessions.length,
+        sessions: kept.map((s) => ({
           id: s.id, title: s.title, cwd: s.cwd, model: s.model,
           provider: s.provider, updatedAt: s.updatedAt, archived: s.archived,
         })),
       }
     },
-    async get_session({ id } = {}) {
+    async get_session({ id, maxMessages } = {}) {
+      const cap = nonNegInt(maxMessages, 'maxMessages') ?? DEFAULT_MAX_MESSAGES
       const s = await load(id)
+      const total = s.messages.length
+      // 超限时保留「最近」的消息（尾部）：回顾/续写场景下尾部信息量最大
+      const messages = cap === 0 || total <= cap ? s.messages : s.messages.slice(total - cap)
       return {
         id: s.id, title: s.title, cwd: s.cwd, model: s.model, provider: s.provider,
         createdAt: s.createdAt, updatedAt: s.updatedAt, tokens: s.tokens, archived: s.archived,
-        messages: s.messages, toolCallCounts: countBy(s.toolCalls), badLines: s.badLines, // M-3：对齐 web detail/JSON 导出，对抗语料下透出不可解析行数
+        totalMessages: total,
+        messagesTruncated: messages.length < total,
+        messages, toolCallCounts: countBy(s.toolCalls), badLines: s.badLines, // M-3：对齐 web detail/JSON 导出，对抗语料下透出不可解析行数
       }
     },
     async rename_session({ id, title } = {}) {

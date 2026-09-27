@@ -82,12 +82,27 @@ function renderList() {
     </li>`).join('') || '<li>无匹配会话</li>'
 }
 
-async function selectSession(id) {
-  state.selected = id
+// 在途守卫（#2/#3）：每次选择自增序号，只有「最新一次」的响应才允许落地。
+// 否则快速点击 A→B 时 A 的迟到响应会覆盖 B 的面板，而 state.selected 与面板脱节，
+// 后续 rename/archive 会作用到错误的会话。
+let detailSeq = 0
+
+const markSelected = (id) =>
   document.querySelectorAll('#list li').forEach((li) => li.classList.toggle('sel', li.dataset.id === id))
-  $('#detail').innerHTML = '<p class="empty loading">加载中…</p>' // 详情在途占位（N7）
-  const { session: s } = await api(`/api/sessions/${encodeURIComponent(id)}`)
-  state.detailMtime = s.mtimeMs // 乐观并发：archive/delete 回填 expectedMtimeMs（Task 8 I7）
+
+function clearDetail(msg = '选择左侧会话查看详情') {
+  detailSeq++ // 使所有在途详情响应作废（归档/删除后不得被迟到响应「复活」）
+  state.selected = null
+  state.detailMtime = null
+  $('#detail').innerHTML = `<p class="empty">${esc(msg)}</p>`
+}
+
+async function fetchDetail(id) {
+  const { session } = await api(`/api/sessions/${encodeURIComponent(id)}`)
+  return session
+}
+
+function renderDetail(s) {
   $('#detail').innerHTML = `
     <h2>${esc(s.title ?? '(未命名)')}</h2>
     <div class="meta">ID: ${esc(s.id)} · ${esc(s.cwd ?? '?')} · ${esc(s.model ?? '?')} (${esc(s.provider ?? '?')}) · ${fmtTime(s.createdAt)} → ${fmtTime(s.updatedAt)} · tokens: ${s.tokens ?? '?'}</div>
@@ -102,13 +117,57 @@ async function selectSession(id) {
     ${s.messages.map((m) => `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? '🧑 用户' : '🤖 助手'} · ${fmtTime(m.timestamp)}</div><pre>${esc(m.text)}</pre></div>`).join('')}`
 }
 
+async function selectSession(id) {
+  const prev = state.selected
+  const seq = ++detailSeq
+  state.selected = id
+  markSelected(id)
+  $('#detail').innerHTML = '<p class="empty loading">加载中…</p>' // 详情在途占位（N7）
+  let s
+  try {
+    s = await fetchDetail(id)
+  } catch (e) {
+    if (seq !== detailSeq) return // 已被更晚的选择接管，静默退出
+    // #3 失败回滚：selected 已前移但面板拿不到内容——回退到上一个会话，
+    // 让「面板可见的内容」与「操作将作用的对象」始终一致（否则 rename 会改错会话）。
+    // 至多回退一步、不递归：若上一个也失败则清空，避免服务故障时无限重试。
+    let restored = false
+    if (prev !== null) {
+      const s2 = await fetchDetail(prev).catch(() => null)
+      if (seq !== detailSeq) return
+      if (s2) {
+        state.selected = prev
+        state.detailMtime = s2.mtimeMs
+        markSelected(prev)
+        renderDetail(s2)
+        restored = true
+      }
+    }
+    if (!restored) clearDetail('选择左侧会话查看详情')
+    throw e
+  }
+  if (seq !== detailSeq) return // 迟到响应：更晚的选择/清空已接管，丢弃本次结果
+  state.detailMtime = s.mtimeMs // 乐观并发：archive/delete 回填 expectedMtimeMs（Task 8 I7）
+  renderDetail(s)
+}
+
+// 下载（#5/#6）：失败时透出服务端错误体（而非裸 HTTP 状态码）；
+// blob URL 必须延后 revoke——同步 revoke 会让 Firefox/Safari 取消尚未落盘的下载。
 async function download(path, filename) {
   const res = await fetch(path, { headers: { authorization: `Bearer ${token}` } })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    const err = new Error(data.error?.message ?? `HTTP ${res.status}`)
+    err.code = data.error?.code
+    throw err
+  }
   const blob = await res.blob()
-  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: filename })
+  const url = URL.createObjectURL(blob)
+  const a = Object.assign(document.createElement('a'), { href: url, download: filename })
+  document.body.appendChild(a) // 部分浏览器要求节点在文档内才触发下载
   a.click()
-  URL.revokeObjectURL(a.href)
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 60_000) // 延后释放，避免取消进行中的下载
 }
 
 $('#detail').addEventListener('click', async (ev) => {
@@ -137,16 +196,14 @@ $('#detail').addEventListener('click', async (ev) => {
       if (!confirm('归档该会话？（移入 archived_sessions，可手动移回）')) return
       await api(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify({ expectedMtimeMs: state.detailMtime }) })
       toast('已归档')
-      state.selected = null
-      $('#detail').innerHTML = '<p class="empty">选择左侧会话查看详情</p>'
+      clearDetail()
       await refresh()
       renderList()
     } else if (act === 'delete') {
       if (!confirm('删除该会话？（软删除：移入 .csm-trash 并先备份，不会物理删除）')) return
       await api(`/api/sessions/${encodeURIComponent(id)}/delete`, { method: 'POST', body: JSON.stringify({ expectedMtimeMs: state.detailMtime }) })
       toast('已移入回收站')
-      state.selected = null
-      $('#detail').innerHTML = '<p class="empty">选择左侧会话查看详情</p>'
+      clearDetail()
       await refresh()
       renderList()
     }
