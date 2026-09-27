@@ -35,7 +35,7 @@ server.registerTool('list_sessions', {
 
 server.registerTool('get_session', {
   title: '读取会话全文',
-  description: '读取一个会话的完整内容（消息流、toolCallCounts、tokens、badLines）。大会话输出最坏可达 ~0.7MB（数十万 tokens）——若只为回顾/迁移，优先用 export_session 落地文件再按需读片段，别把全文灌进上下文。',
+  description: '读取一个会话的完整内容（消息流、toolCallCounts、tokens、badLines）。大会话输出最坏可达 ~1.8MB（数万至数十万 tokens）——若只为回顾/迁移，优先用 export_session 落地文件再按需读片段，别把全文灌进上下文。',
   inputSchema: {
     id: z.string().describe('会话 ID'),
   },

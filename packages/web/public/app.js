@@ -3,7 +3,7 @@ const token = params.get('token') ?? sessionStorage.getItem('csm-token') // N1�
 if (params.get('token')) sessionStorage.setItem('csm-token', params.get('token'))
 
 const $ = (sel) => document.querySelector(sel)
-const state = { sessions: [], selected: null, view: 'sessions', all: [], detailMtime: null }
+const state = { selected: null, all: [], detailMtime: null }
 
 function toast(msg, isErr = false) {
   const el = $('#toast')
@@ -18,6 +18,12 @@ function fatal(title, message, hint) {
   $('#count').textContent = ''
   $('#list').innerHTML = `<li class="fatal"><div class="t">${esc(title)}</div><div class="m">${esc(message)}</div>${hint ? `<div class="m hint">${esc(hint)}</div>` : ''}</li>`
   $('#detail').innerHTML = '<p class="empty">无法加载会话列表，请先解决左侧提示</p>'
+}
+
+// 加载占位（N7）：首屏 ~1.2s、详情 ~1.26s 期间不留白，让用户能区分「加载中」与「已损坏」。
+function listLoading() {
+  $('#count').textContent = ''
+  $('#list').innerHTML = '<li class="loading"><div class="m">加载中…</div></li>'
 }
 
 async function api(path, opts = {}) {
@@ -62,7 +68,6 @@ function renderList() {
     if (q && ![s.title, s.id, s.cwd ?? ''].some((f) => String(f).toLowerCase().includes(q))) return false
     return true
   })
-  state.sessions = sessions
   $('#count').textContent = `${sessions.length} 个会话`
   $('#list').innerHTML = sessions.map((s) => `
     <li data-id="${esc(s.id)}" class="${state.selected === s.id ? 'sel' : ''}">
@@ -80,6 +85,7 @@ function renderList() {
 async function selectSession(id) {
   state.selected = id
   document.querySelectorAll('#list li').forEach((li) => li.classList.toggle('sel', li.dataset.id === id))
+  $('#detail').innerHTML = '<p class="empty loading">加载中…</p>' // 详情在途占位（N7）
   const { session: s } = await api(`/api/sessions/${encodeURIComponent(id)}`)
   state.detailMtime = s.mtimeMs // 乐观并发：archive/delete 回填 expectedMtimeMs（Task 8 I7）
   $('#detail').innerHTML = `
@@ -186,7 +192,6 @@ async function loadStats() {
 }
 
 function switchView(view) {
-  state.view = view
   $('#tab-sessions').classList.toggle('active', view === 'sessions')
   $('#tab-stats').classList.toggle('active', view === 'stats')
   $('#view-sessions').hidden = view !== 'sessions'
@@ -201,6 +206,7 @@ if (!token) {
   fatal('缺少访问令牌', 'URL 里没有 ?token= 参数，因此无法读取会话列表。',
     '请使用服务启动时终端打印的完整地址打开，例如：http://127.0.0.1:4173/?token=<你的 token>；也可以用固定 token 启动：CSM_TOKEN=mytoken npm run web')
 } else {
+  listLoading()
   refresh().then(renderList).catch((e) => {
     if (e.code === 'unauthorized') {
       fatal('访问令牌无效', '服务拒绝了本次请求（401）。', 'token 可能已过期（服务重启后会重新随机生成）。请用启动时打印的完整地址重开，或用固定 token 启动：CSM_TOKEN=mytoken npm run web')

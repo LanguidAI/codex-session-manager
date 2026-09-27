@@ -22,13 +22,13 @@ description: 管理 Codex 历史会话——查询/搜索会话列表、读取�
 3. 批量清理时**逐个确认**再执行 archive/delete；30 秒内活跃写入的会话会被拒绝（code=active），提醒用户先关闭对应会话。
 
 ## 安全语义（务必向用户传达）
-- 所有写操作自动备份到 ~/.codex/.csm-backups/
+- 会话写操作（重命名/归档/删除）先备份到 ~/.codex/.csm-backups/；归档=移入 archived_sessions/、删除=移入 .csm-trash/
 - delete 是移入回收站，可手动找回
 - 绝不修改会话 jsonl 内容本身，重命名只写标题索引
 
 ## 体积与性能（务必遵守）
 - `list_sessions` 在大语料下响应可达上百 KB：**永远先用 `query`/`cwd`/`model` 过滤**，不要无过滤地全量拉取。
-- `get_session` 返回完整消息流，长会话最坏可达 ~0.7MB（数十万 tokens）：回顾或迁移长会话时**优先 `export_session` 落地成文件**再按需读取片段，别把全文直接灌进上下文。
+- `get_session` 返回完整消息流，长会话最坏可达 ~1.8MB（数万至数十万 tokens）：回顾或迁移长会话时**优先 `export_session` 落地成文件**再按需读取片段，别把全文直接灌进上下文。
 
 ## 归档/删除后的可见性（务必向用户说明）
 - `list_sessions` **只列活跃会话**：一旦 `archive_session`/`delete_session`，会话即**从列表消失**，且**没有任何 MCP 工具能重新列出归档区/回收站里的会话**。
