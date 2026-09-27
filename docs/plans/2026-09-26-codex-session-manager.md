@@ -10,7 +10,7 @@
 
 **设计文档:** `docs/plans/2026-09-26-codex-session-manager-design.md`（已批准）
 
-**仓库:** `/Users/xuxianxian/Documents/test/codex-session-manager`（git remote 已配置为 `ssh://git@ssh.github.com:443/LanguidAI/codex-session-manager.git`，推送用 `git push` 即可；**github.com:443 HTTPS 在本网络被墙，勿改回 HTTPS remote**）
+**仓库:** `~/codex-session-manager`（git remote 已配置为 `ssh://git@ssh.github.com:443/LanguidAI/codex-session-manager.git`，推送用 `git push` 即可；**远端走 SSH over 443；请勿改回 HTTPS remote**）
 
 ---
 
@@ -20,7 +20,7 @@
 
 1. **`$CODEX_HOME/session_index.jsonl`**（默认 `~/.codex/`）— 每行一个 JSON：
    ```json
-   {"id":"019daf28-767c-7002-808c-b917cc682505","thread_name":"介绍自己","updated_at":"2026-04-21T08:29:35.343959Z"}
+   {"id":"019d0000-0000-7000-8000-000000000000","thread_name":"示例会话","updated_at":"2026-04-21T08:29:35.343959Z"}
    ```
    同一 id 可出现多行（改名历史），**后出现的行生效**。文件可能不存在。
 
@@ -142,7 +142,7 @@ Codex 会话管理器：Web 面板 + Codex 官方插件。实施中，见 docs/p
 
 **Step 4: 安装依赖并验证 workspace 链接**
 
-Run: `cd /Users/xuxianxian/Documents/test/codex-session-manager && npm install`
+Run: `cd ~/codex-session-manager && npm install`
 Expected: 生成 `package-lock.json` 与 `node_modules/`，无 error（warn 可忽略）
 
 Run: `ls node_modules/@csm`
@@ -3161,7 +3161,7 @@ Expected: PASS（66/66：core 55 + web 11）
 
 **Step 5: 手动验证（真实数据只读操作）**
 
-Run: `cd /Users/xuxianxian/Documents/test/codex-session-manager && (CODEX_HOME=$HOME/.codex node packages/web/server.mjs &); sleep 1`
+Run: `cd ~/codex-session-manager && (CODEX_HOME=$HOME/.codex node packages/web/server.mjs &); sleep 1`
 然后从 stdout 拿 `http://127.0.0.1:4173/?token=...` 用浏览器打开，核对清单：
 - [ ] 会话列表显示真实会话（标题/时间/项目/模型）
 - [ ] 搜索关键字、项目目录、模型过滤都生效且**瞬时响应**（客户端过滤，无 ~1s 迟滞——前置修订 4）
@@ -3601,7 +3601,7 @@ description: 管理 Codex 历史会话——查询/搜索会话列表、读取�
 
 Run:
 ```bash
-cd /Users/xuxianxian/Documents/test/codex-session-manager
+cd ~/codex-session-manager
 printf '%s\n' \
 '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
 '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
@@ -3986,7 +3986,7 @@ git commit -m "feat(plugin): 本地 marketplace 安装/卸载脚本（config.tom
 
 **Step 1: 全量测试**
 
-Run: `cd /Users/xuxianxian/Documents/test/codex-session-manager && npm test`
+Run: `cd ~/codex-session-manager && npm test`
 Expected: 三个包全部 PASS，0 fail
 
 **Step 2: 写完整 README.md**
@@ -4029,7 +4029,7 @@ npm run uninstall:plugin
 **Step 3: 真实安装插件（作用于真实 ~/.codex，config 自动备份）**
 
 Run: `npm run install:plugin`
-Expected: 打印「已安装 … → /Users/xuxianxian/.codex/marketplaces/csm」
+Expected: 打印「已安装 … → ~/.codex/marketplaces/csm」
 
 Run: `grep -A2 'marketplaces.csm' ~/.codex/config.toml && grep -A1 'session-manager@csm' ~/.codex/config.toml`
 Expected: 能看到两个新节；`ls ~/.codex/config.toml.bak-csm-*` 有备份文件

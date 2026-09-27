@@ -24,7 +24,7 @@ npm run uninstall:plugin
 
 ## 安全设计
 - 只监听 127.0.0.1 + 随机 bearer token
-- 所有写操作先备份到 `~/.codex/.csm-backups/`
+- 会话写操作（重命名/归档/删除）先备份到 `~/.codex/.csm-backups/`；插件安装的 `config.toml` 备份为同目录下 `config.toml.bak-csm-<时间戳>`
 - 删除 = 移入回收站，绝不物理删除；归档 = 移入官方归档目录
 - 30 秒内活跃写入的会话默认拒绝变更（`force` 可越过）
 - 读后写前 mtime 校验（冲突返回 409）
