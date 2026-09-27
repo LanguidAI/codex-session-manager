@@ -14,6 +14,10 @@ function makeEl() {
   const el = {
     innerHTML: '', textContent: '', className: '', value: '', hidden: false, checked: false,
     dataset: {}, classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    _attrs: {},
+    setAttribute(k, v) { el._attrs[k] = v },
+    getAttribute(k) { return el._attrs[k] ?? null },
+    removeAttribute(k) { delete el._attrs[k] },
     _listeners: {},
     addEventListener(ev, fn) { (el._listeners[ev] ??= []).push(fn) },
     click() {}, remove() {},
@@ -34,7 +38,7 @@ function fire(el, ev, payload) {
 }
 
 /** 在 vm 里跑客户端脚本。vm 内 setTimeout 被替换为记录器（timers），便于断言「延后执行」。 */
-async function runApp({ search = '', fetchImpl, store = {}, flush: doFlush = true, events = [], timers = [] } = {}) {
+async function runApp({ search = '', fetchImpl, store = {}, flush: doFlush = true, events = [], timers = [], clipboard = { writeText: async () => {} }, execCommand } = {}) {
   const els = new Map()
   const el = (sel) => { if (!els.has(sel)) els.set(sel, makeEl()); return els.get(sel) }
   const calls = []
@@ -50,14 +54,18 @@ async function runApp({ search = '', fetchImpl, store = {}, flush: doFlush = tru
         const e = makeEl()
         e.click = () => events.push('a.click')
         e.remove = () => events.push('a.remove')
+        e.select = () => events.push('select')
+        e.style = {}
+        e.value = ''
         return e
       },
-      body: { appendChild: () => events.push('append') },
+      body: { appendChild: () => events.push('append'), removeChild: () => events.push('removeChild') },
+      execCommand: execCommand ?? (() => false),
     },
     location: { search },
     sessionStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v } },
     fetch: fetchImpl ? recordingFetch : () => Promise.reject(new Error('fetch stub not provided')),
-    navigator: { clipboard: { writeText: async () => {} } },
+    navigator: clipboard === null ? {} : { clipboard }, // null = 模拟无 clipboard API（undefined 会触发默认参数，故用 null）
     URL: {
       createObjectURL: () => { events.push('createObjectURL'); return 'blob:x' },
       revokeObjectURL: () => events.push('revoke'),
@@ -323,6 +331,140 @@ test('#3 回滚不得递归：连回滚目标 A 也拉取失败时必须收敛�
   assert.ok(detailCalls <= 2, `详情请求次数应有限（实际 ${detailCalls}），不得递归回滚 A→B→A…`)
   assert.doesNotMatch(detailHtml(el), /加载中/, '最终不应停在载入态')
   assert.equal(vm.runInContext('state.selected', ctx), null, '无可用会话时应清空选中，而非指向读不出的 id')
+})
+
+// ---- #4 变更成功但刷新失败：提示不得让用户以为变更失败 ----
+
+test('#4 重命名成功但 refresh 失败：提示须区分「已成功」与「刷新失败」', async () => {
+  let refreshShouldFail = false
+  const { el, fire: doFire, flush } = await runApp({
+    search: '?token=good',
+    fetchImpl: async (path, opts = {}) => {
+      if (opts.method === 'PATCH') return okJson({ id: 'A', title: 'NEW' }) // 变更成功
+      if (String(path).includes('archived=1')) {
+        if (refreshShouldFail) return { ok: false, status: 500, json: async () => ({ error: { message: '扫描失败' } }) }
+        return okJson({ sessions: [{ id: 'A', title: 'NEW', cwd: '/p', model: 'm', updatedAt: '2026-01-01T00:00:00Z', size: 1, archived: false }] })
+      }
+      if (String(path).endsWith('/api/sessions/A')) return okJson({ session: { id: 'A', title: 'NEW', messages: [], mtimeMs: 1 } })
+      return okJson({ sessions: [] })
+    },
+  })
+  clickLi(doFire, el, 'A')
+  await flush()
+  refreshShouldFail = true // 变更之后再让 refresh 失败
+  clickAct(doFire, el, 'rename')
+  await flush()
+  await flush()
+
+  // 判别器：修复前 catch 统一 toast(`失败：${msg}`) → 用户以为重命名没成功，会重复操作。
+  // 注意「刷新失败」字样是允许的（那正是要告知的信息），禁止的是把整体定性为失败。
+  const t = toastText(el)
+  assert.ok(t.startsWith('已重命名'), `应以成功信息开头（实际「${t}」）`)
+  assert.doesNotMatch(t, /^失败：/, '不得沿用「失败：」这一笼统前缀')
+  assert.match(t, /刷新/, '并提示列表刷新失败（否则用户看到陈旧列表不知原因）')
+})
+
+test('#4 变更本身失败：仍须提示失败（回归保护）', async () => {
+  const { el, fire: doFire, flush } = await runApp({
+    search: '?token=good',
+    fetchImpl: async (path, opts = {}) => {
+      if (opts.method === 'PATCH') return { ok: false, status: 409, json: async () => ({ error: { code: 'conflict', message: '已变化' } }) }
+      if (String(path).endsWith('/api/sessions/A')) return okJson({ session: { id: 'A', title: 'A', messages: [], mtimeMs: 1 } })
+      return okJson({ sessions: [{ id: 'A', title: 'A', cwd: '/p', model: 'm', updatedAt: '2026-01-01T00:00:00Z', size: 1, archived: false }] })
+    },
+  })
+  clickLi(doFire, el, 'A')
+  await flush()
+  clickAct(doFire, el, 'rename')
+  await flush()
+  assert.match(toastText(el), /变化|失败|冲突/, '变更真失败时必须提示失败')
+})
+
+// ---- #9 clipboard 兜底 ----
+
+test('#9 非安全上下文（无 navigator.clipboard）：回退到 textarea+execCommand，不得静默失败', async () => {
+  const copied = []
+  const { el, fire: doFire, flush } = await runApp({
+    search: '?token=good',
+    clipboard: null, // 模拟 http://<局域网IP> 等非安全上下文
+    execCommand: (cmd) => { copied.push(cmd); return true },
+    fetchImpl: async (path) => {
+      if (String(path).endsWith('/resume')) return okJson({ text: '恢复上下文内容' })
+      if (String(path).endsWith('/api/sessions/A')) return okJson({ session: { id: 'A', title: 'A', messages: [], mtimeMs: 1 } })
+      return okJson({ sessions: [{ id: 'A', title: 'A', cwd: '/p', model: 'm', updatedAt: '2026-01-01T00:00:00Z', size: 1, archived: false }] })
+    },
+  })
+  clickLi(doFire, el, 'A')
+  await flush()
+  clickAct(doFire, el, 'resume')
+  await flush()
+  assert.deepEqual(copied, ['copy'], '无 clipboard API 时应回退 execCommand("copy")')
+  assert.match(toastText(el), /已复制|复制/, '应给出成功提示')
+})
+
+test('#9 完全无法复制：提示用户手动复制，而非静默无反馈', async () => {
+  const { el, fire: doFire, flush } = await runApp({
+    search: '?token=good',
+    clipboard: null,
+    execCommand: () => false, // 兜底也失败
+    fetchImpl: async (path) => {
+      if (String(path).endsWith('/resume')) return okJson({ text: '恢复上下文内容' })
+      if (String(path).endsWith('/api/sessions/A')) return okJson({ session: { id: 'A', title: 'A', messages: [], mtimeMs: 1 } })
+      return okJson({ sessions: [{ id: 'A', title: 'A', cwd: '/p', model: 'm', updatedAt: '2026-01-01T00:00:00Z', size: 1, archived: false }] })
+    },
+  })
+  clickLi(doFire, el, 'A')
+  await flush()
+  clickAct(doFire, el, 'resume')
+  await flush()
+  assert.match(toastText(el), /手动|复制失败|无法/, '复制失败必须显式告知用户')
+})
+
+// ---- #8 统计页缓存 ----
+
+test('#8 反复切换统计页只扫描一次（缓存），数据变更后才重新扫描', async () => {
+  let statsCalls = 0
+  const { el, fire: doFire, flush } = await runApp({
+    search: '?token=good',
+    fetchImpl: async (path) => {
+      if (String(path).includes('/api/stats')) {
+        statsCalls++
+        return okJson({ total: 1, archived: 0, recent7: 1, byDay: {}, byProject: {}, byModel: {}, byProvider: {} })
+      }
+      return okJson({ sessions: [{ id: 'A', title: 'A', cwd: '/p', model: 'm', updatedAt: '2026-01-01T00:00:00Z', size: 1, archived: false }] })
+    },
+  })
+  doFire(el('#tab-stats'), 'click')
+  await flush()
+  doFire(el('#tab-sessions'), 'click')
+  doFire(el('#tab-stats'), 'click')
+  await flush()
+  doFire(el('#tab-sessions'), 'click')
+  doFire(el('#tab-stats'), 'click')
+  await flush()
+  // 判别器：修复前每次切到统计都请求 → 3 次。缓存后应为 1 次。
+  assert.equal(statsCalls, 1, `3 次切换应只扫描 1 次（实际 ${statsCalls} 次）`)
+})
+
+// ---- #7 可访问性 ----
+
+test('#7 toast 可被屏幕阅读器播报（role/aria-live）', () => {
+  const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'index.html'), 'utf8')
+  assert.match(html, /id="toast"[^>]*aria-live/, '#toast 需要 aria-live，否则读屏软件不会播报')
+  assert.match(html, /id="toast"[^>]*role=/, '#toast 需要 role 属性')
+})
+
+test('#7 搜索/目录输入框有可访问名称（label 或 aria-label，而非仅 placeholder）', () => {
+  const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'index.html'), 'utf8')
+  // placeholder 不是可访问名称的可靠替代（读屏与自动填表都会漏）。
+  const hasLabelEl = /<label[^>]*for="q"/.test(html) && /<label[^>]*for="cwd"/.test(html)
+  const hasAriaLabel = /aria-label/.test(html)
+  assert.ok(hasLabelEl || hasAriaLabel, '#q / #cwd 需要 <label for> 或 aria-label')
+})
+
+test('#7 键盘焦点可见（:focus-visible 样式）', () => {
+  const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'style.css'), 'utf8')
+  assert.match(css, /:focus-visible/, '需要 :focus-visible 样式，否则键盘导航看不出焦点')
 })
 
 // ---- #10 源码卫生：死状态字段 ----

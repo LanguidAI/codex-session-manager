@@ -56,19 +56,32 @@ export function toJson(session) {
  */
 export function buildResumeContext(session, { maxMessages = 6, maxCharsPerMessage = 400, goalChars = 1500 } = {}) {
   const firstUser = session.messages.find((m) => m.role === 'user')
-  const recent = maxMessages > 0 ? session.messages.slice(-maxMessages) : []
+  const window = maxMessages > 0 ? session.messages.slice(-maxMessages) : []
+  // I-6 去重：短会话（消息数 ≤ maxMessages）时首条用户消息同时落在「原目标」与窗口内。
+  // 保留信息更全的那份（goalChars 1500 > maxCharsPerMessage 400），把它从窗口移除；
+  // 若反过来省略整个「原目标」小节，长目标会从 1500 字缩水到 400 字——那是信息损失而非去重。
+  const recent = firstUser === undefined ? window : window.filter((m) => m !== firstUser)
+  const goalSection = [
+    '## 原目标',
+    firstUser ? clip(firstUser.text, goalChars) : '（无用户消息记录）',
+    '',
+  ]
+  // 窗口被去重抽空（如会话只有一条用户消息）时不留空标题
+  const recentSection = recent.length === 0 ? [] : [
+    '## 最近进展',
+    // I-6：条目之间补空行——Markdown 会把连续行合并进同一段落，
+    // 否则多条「**用户**: …」在渲染后挤成一整块，读不出分隔。
+    ...recent.map((m, i) => `${i > 0 ? '\n' : ''}**${m.role === 'user' ? '用户' : '助手'}**: ${clip(m.text, maxCharsPerMessage)}`),
+    '',
+  ]
   return [
     `# 请继续这个 Codex 会话：${session.title ?? session.id}`,
     `- 原项目目录: ${session.cwd ?? '?'}`,
     `- 使用模型: ${session.model ?? '?'}`,
     `- 最后活跃: ${session.updatedAt ?? '?'}`,
     '',
-    '## 原目标',
-    firstUser ? clip(firstUser.text, goalChars) : '（无用户消息记录）',
-    '',
-    '## 最近进展',
-    ...recent.map((m) => `**${m.role === 'user' ? '用户' : '助手'}**: ${clip(m.text, maxCharsPerMessage)}`),
-    '',
+    ...goalSection,
+    ...recentSection,
     '请基于以上上下文继续完成任务。',
   ].join('\n')
 }

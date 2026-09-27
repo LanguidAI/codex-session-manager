@@ -179,3 +179,64 @@ test('无标题会话 detail title=null（与 list 的 (未命名) 对齐，审�
     assert.equal(list.sessions[0].title, '(未命名)', 'list 用 (未命名)')
   })
 })
+
+// ---- #12 readBody 体积上限 ----
+
+/** 用裸 socket 发请求：可伪造 Content-Length 而不真发 11MB body（fetch 无法可靠覆盖该头部）。 */
+function rawRequest(port, headers, { timeoutMs = 3000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(port, '127.0.0.1')
+    let buf = ''
+    const done = (v) => { sock.destroy(); resolve(v) }
+    sock.setTimeout(timeoutMs, () => { sock.destroy(); resolve({ status: null, raw: buf, timedOut: true }) })
+    sock.on('connect', () => sock.write(headers))
+    sock.on('data', (d) => {
+      buf += d.toString('utf8')
+      if (/\r\n\r\n/.test(buf)) done({ status: Number(buf.slice(9, 12)), raw: buf })
+    })
+    sock.on('error', reject)
+  })
+}
+
+test('#12 Content-Length 超限：立即 413，不缓冲请求体（防无界 RSS 增长）', async () => {
+  const home = await makeHome()
+  await withServer(home, async ({ base }) => {
+    const port = Number(new URL(base).port)
+    // 声明 20MB 但一个字节也不发：若服务端先缓冲再判断，会一直等 body → timedOut
+    const res = await rawRequest(port,
+      'PATCH /api/sessions/x HTTP/1.1\r\n' +
+      'Host: 127.0.0.1\r\n' +
+      'Authorization: Bearer test-token\r\n' +
+      'Content-Type: application/json\r\n' +
+      'Content-Length: 20000000\r\n' +
+      '\r\n')
+    assert.equal(res.status, 413, `应依据 Content-Length 预检直接 413（实际 ${res.status}${res.timedOut ? '/超时=仍在等待 body' : ''}）`)
+    assert.match(res.raw, /too_large|too large|过大/i, '错误码应表明体积超限')
+  })
+})
+
+test('#12 正常小请求体不受影响（回归保护）', async () => {
+  const home = await makeHome()
+  const p = await writeSession(home, { id: 'a', day: '2026-05-20' })
+  await backdate(p)
+  await withServer(home, async ({ api }) => {
+    const res = await api('/api/sessions/a', { method: 'PATCH', body: JSON.stringify({ title: '新标题' }) })
+    assert.equal(res.status, 200, '常规 PATCH 不应被体积限制误伤')
+    assert.equal((await res.json()).title, '新标题')
+  })
+})
+
+test('#12 varint 式超大 content-length（>Number.MAX_SAFE_INTEGER）不得绕过或崩服务', async () => {
+  const home = await makeHome()
+  await withServer(home, async ({ base }) => {
+    const port = Number(new URL(base).port)
+    const res = await rawRequest(port,
+      'PATCH /api/sessions/x HTTP/1.1\r\n' +
+      'Host: 127.0.0.1\r\n' +
+      'Authorization: Bearer test-token\r\n' +
+      'Content-Type: application/json\r\n' +
+      'Content-Length: 99999999999999999999\r\n' +
+      '\r\n')
+    assert.ok(res.status === 413 || res.status === 400, `应拒绝超大声明（实际 ${res.status}）`)
+  })
+})

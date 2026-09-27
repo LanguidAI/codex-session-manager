@@ -9,6 +9,8 @@ function toast(msg, isErr = false) {
   const el = $('#toast')
   el.textContent = msg
   el.className = `show${isErr ? ' err' : ''}`
+  // #7：错误用 alert（读屏立即打断播报），普通反馈用 status（排队播报，不打断用户）
+  el.setAttribute('role', isErr ? 'alert' : 'status')
   setTimeout(() => (el.className = ''), 2200)
 }
 
@@ -151,6 +153,45 @@ async function selectSession(id) {
   renderDetail(s)
 }
 
+// #4：变更（重命名/归档/删除）成功后再刷新列表——刷新失败不等于变更失败，
+// 若共用同一个 catch 会提示「失败：…」，用户以为没改成功而重复操作。
+async function refreshAfterChange(okMsg) {
+  try {
+    await refresh()
+    renderList()
+    statsCache = null // #8：列表数据变了，统计缓存失效
+    toast(okMsg)
+  } catch (e) {
+    statsCache = null
+    toast(`${okMsg}（列表刷新失败：${e.message}，请手动刷新页面）`, true)
+  }
+}
+
+// #9：clipboard API 仅在安全上下文可用（http://127.0.0.1 满足，局域网 IP 不满足）。
+// 回退到 textarea + execCommand；两者都不可用时明确告知，不静默失败。
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch { /* 继续走兜底 */ }
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
 // 下载（#5/#6）：失败时透出服务端错误体（而非裸 HTTP 状态码）；
 // blob URL 必须延后 revoke——同步 revoke 会让 Firefox/Safari 取消尚未落盘的下载。
 async function download(path, filename) {
@@ -180,14 +221,13 @@ $('#detail').addEventListener('click', async (ev) => {
       const title = prompt('新标题：')
       if (!title) return
       await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) })
-      toast('已重命名')
-      await refresh()
-      renderList()
+      await refreshAfterChange('已重命名')
       await selectSession(id)
     } else if (act === 'resume') {
       const { text } = await api(`/api/sessions/${encodeURIComponent(id)}/resume`)
-      await navigator.clipboard.writeText(text)
-      toast('恢复上下文已复制，去 Codex 新建对话粘贴即可')
+      const ok = await copyText(text)
+      if (ok) toast('恢复上下文已复制，去 Codex 新建对话粘贴即可')
+      else toast('复制失败：请手动复制（浏览器限制了剪贴板访问）', true)
     } else if (act === 'export-md') {
       await download(`/api/sessions/${encodeURIComponent(id)}/export?fmt=md`, `${id}.md`)
     } else if (act === 'export-json') {
@@ -195,17 +235,13 @@ $('#detail').addEventListener('click', async (ev) => {
     } else if (act === 'archive') {
       if (!confirm('归档该会话？（移入 archived_sessions，可手动移回）')) return
       await api(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify({ expectedMtimeMs: state.detailMtime }) })
-      toast('已归档')
       clearDetail()
-      await refresh()
-      renderList()
+      await refreshAfterChange('已归档')
     } else if (act === 'delete') {
       if (!confirm('删除该会话？（软删除：移入 .csm-trash 并先备份，不会物理删除）')) return
       await api(`/api/sessions/${encodeURIComponent(id)}/delete`, { method: 'POST', body: JSON.stringify({ expectedMtimeMs: state.detailMtime }) })
-      toast('已移入回收站')
       clearDetail()
-      await refresh()
-      renderList()
+      await refreshAfterChange('已移入回收站')
     }
   } catch (e) {
     const msg = e.code === 'active' ? '会话正被 Codex 使用中，稍后再试'
@@ -225,8 +261,12 @@ for (const sel of ['#q', '#cwd', '#model', '#archived']) {
   $(sel).addEventListener(sel === '#model' || sel === '#archived' ? 'change' : 'input', () => renderList())
 }
 
-async function loadStats() {
-  const s = await api('/api/stats')
+// #8：统计需全语料扫描（700 会话 ≈ 1s+），同一份列表数据下反复切换标签不必重扫。
+// 缓存内容而非「已加载」标志：数据变更时由 refreshAfterChange 置空重取。
+let statsCache = null
+
+async function loadStats({ force = false } = {}) {
+  const s = force || statsCache === null ? (statsCache = await api('/api/stats')) : statsCache
   const rows = (obj, limit = 10) =>
     Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, limit)
       .map(([k, v]) => `<div class="row"><span>${esc(k)}</span><b>${v}</b></div>`).join('')

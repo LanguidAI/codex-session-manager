@@ -14,9 +14,11 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 }
-const STATUS_BY_CODE = { not_found: 404, conflict: 409, active: 409, invalid: 400 }
+const STATUS_BY_CODE = { not_found: 404, conflict: 409, active: 409, invalid: 400, too_large: 413 }
 /** 标题长度上限（I6：core 不限，web/工具层封顶；超长 → 400 invalid）。 */
 const MAX_TITLE = 200
+/** 请求体上限（I4：防无界缓冲把 RSS 拉爆；rename/archive 的 body 仅几十字节，10MB 已极宽松）。 */
+const MAX_BODY_BYTES = 10 * 1024 * 1024
 
 function sendJson(res, status, data) {
   const body = JSON.stringify(data)
@@ -33,8 +35,23 @@ function sendError(res, status, code, message) {
 }
 
 async function readBody(req) {
+  // I4：先看 Content-Length 预检——超限直接拒绝，一个字节都不缓冲。
+  // 这一步让「声明超大但慢慢发」的请求立刻失败，而不是边收边涨 RSS。
+  const declared = Number(req.headers['content-length'])
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    throw new core.CsmError('too_large', `request body too large (max ${MAX_BODY_BYTES} bytes)`)
+  }
   const chunks = []
-  for await (const c of req) chunks.push(c)
+  let total = 0
+  // 双保险：Content-Length 可缺失（chunked）或撒谎，故按实际字节累加再判一次。
+  for await (const c of req) {
+    total += c.length
+    if (total > MAX_BODY_BYTES) {
+      req.destroy() // 停止继续接收，别把剩余字节读进内存
+      throw new core.CsmError('too_large', `request body too large (max ${MAX_BODY_BYTES} bytes)`)
+    }
+    chunks.push(c)
+  }
   if (chunks.length === 0) return {}
   let parsed
   try {

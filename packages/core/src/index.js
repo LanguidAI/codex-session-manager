@@ -1,5 +1,6 @@
 export * from './errors.js'
 export * from './paths.js'
+export * from './dates.js'
 export * from './reader.js'
 export * from './catalog.js'
 export * from './mutate.js'

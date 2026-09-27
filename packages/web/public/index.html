@@ -17,11 +17,14 @@
 <main>
   <section id="view-sessions">
     <div class="toolbar">
+      <label class="sr-only" for="q">搜索会话</label>
       <input id="q" type="search" placeholder="搜索标题 / ID / 项目目录…">
+      <label class="sr-only" for="cwd">项目目录包含</label>
       <input id="cwd" type="text" placeholder="项目目录包含…">
+      <label class="sr-only" for="model">按模型筛选</label>
       <select id="model"><option value="">全部模型</option></select>
       <label class="chk"><input id="archived" type="checkbox"> 含归档</label>
-      <span id="count" class="count"></span>
+      <span id="count" class="count" role="status" aria-live="polite"></span>
     </div>
     <div class="layout">
       <ul id="list"></ul>
@@ -30,7 +33,7 @@
   </section>
   <section id="view-stats" hidden></section>
 </main>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 <script src="app.js"></script>
 </body>
 </html>

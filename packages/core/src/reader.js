@@ -59,7 +59,11 @@ function handleLine(line, session) {
       session.originator = p.originator ?? session.originator
       session.cliVersion = p.cli_version ?? session.cliVersion
       session.provider = p.model_provider ?? session.provider
-      session.createdAt = p.timestamp ?? line.timestamp ?? session.createdAt
+      // I-2：typeof 守卫——语料若给出数字/对象时间戳，直接透传会污染 createdAt，
+      // 进而使 export.json 输出非法类型、resume 头部显示 [object Object]。
+      session.createdAt = (typeof p.timestamp === 'string' ? p.timestamp : null)
+        ?? (typeof line.timestamp === 'string' ? line.timestamp : null)
+        ?? session.createdAt
       break
     case 'turn_context':
       if (session.model === null && typeof p.model === 'string') session.model = p.model

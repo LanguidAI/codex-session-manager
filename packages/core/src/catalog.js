@@ -2,6 +2,7 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { fastMeta } from './reader.js'
 import { layout } from './paths.js'
+import { parseIsoMs } from './dates.js'
 
 /** 读 session_index.jsonl → Map<id, {title, updatedAt}>；同 id 后行覆盖前行；非字符串 updated_at 视为无。 */
 export async function readIndex(home) {
@@ -80,7 +81,7 @@ export async function listSessions({ home, q, cwd, model, includeArchived = fals
       }
       if (!meta.id) continue
       const idx = index.get(meta.id)
-      const idxMs = idx?.updatedAt ? Date.parse(idx.updatedAt) : NaN
+      const idxMs = parseIsoMs(idx?.updatedAt) // I-2：严格 ISO 形状；宽松格式（2026/01/01）不再冒充 updatedAt，回落文件 mtime
       const useIndex = Number.isFinite(idxMs) && idxMs > st.mtimeMs
       const rec = {
         id: meta.id,
