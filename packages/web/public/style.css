@@ -20,6 +20,9 @@ main { padding: 14px 18px; }
 #list li { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; cursor: pointer; }
 #list li:hover { border-color: var(--accent); }
 #list li.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+#list li.fatal { border-color: var(--danger); cursor: default; }
+#list li.fatal .t { color: var(--danger); }
+#list li.fatal .hint { color: var(--text); }
 #list .t { font-weight: 600; }
 #list .m { color: var(--muted); font-size: 12px; margin-top: 3px; display: flex; gap: 8px; flex-wrap: wrap; }
 .badge { border: 1px solid var(--border); border-radius: 6px; padding: 0 6px; font-size: 11px; }

@@ -16,6 +16,8 @@ Codex Desktop 会话管理器：**本地 Web 面板** + **Codex 官方插件**�
 npm install
 npm test                # 全部测试（使用临时 CODEX_HOME，不碰真实数据）
 npm run web             # 启动面板，打开终端打印的 http://127.0.0.1:4173/?token=...
+                        # token 每次启动随机；想固定：CSM_TOKEN=mytoken npm run web → 打开 http://127.0.0.1:4173/?token=mytoken
+                        # 注意：URL 必须带 ?token=，否则页面只显示常驻的排查提示（不渲染列表）
 npm run install:plugin  # 安装 Codex 插件（自动备份 config.toml），重启 Codex Desktop
 npm run uninstall:plugin
 ```

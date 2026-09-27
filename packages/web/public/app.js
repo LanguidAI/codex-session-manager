@@ -12,6 +12,14 @@ function toast(msg, isErr = false) {
   setTimeout(() => (el.className = ''), 2200)
 }
 
+// 常驻错误块：token 缺失 / API 失败时渲染进主区域（列表位），不再靠 2.2s 即淡出的 toast
+// ——否则用户看到的是「一片空白」，最该看到的排查指引恰好最短命。
+function fatal(title, message, hint) {
+  $('#count').textContent = ''
+  $('#list').innerHTML = `<li class="fatal"><div class="t">${esc(title)}</div><div class="m">${esc(message)}</div>${hint ? `<div class="m hint">${esc(hint)}</div>` : ''}</li>`
+  $('#detail').innerHTML = '<p class="empty">无法加载会话列表，请先解决左侧提示</p>'
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     ...opts,
@@ -189,7 +197,16 @@ $('#tab-sessions').addEventListener('click', () => switchView('sessions'))
 $('#tab-stats').addEventListener('click', () => switchView('stats'))
 
 if (!token) {
-  toast('URL 缺少 ?token=，请使用服务启动时打印的完整地址', true)
+  // 常驻指引（含如何重拿 token），不再只弹 2.2s 即逝的 toast
+  fatal('缺少访问令牌', 'URL 里没有 ?token= 参数，因此无法读取会话列表。',
+    '请使用服务启动时终端打印的完整地址打开，例如：http://127.0.0.1:4173/?token=<你的 token>；也可以用固定 token 启动：CSM_TOKEN=mytoken npm run web')
 } else {
-  refresh().then(renderList).catch((e) => toast(e.message, true))
+  refresh().then(renderList).catch((e) => {
+    if (e.code === 'unauthorized') {
+      fatal('访问令牌无效', '服务拒绝了本次请求（401）。', 'token 可能已过期（服务重启后会重新随机生成）。请用启动时打印的完整地址重开，或用固定 token 启动：CSM_TOKEN=mytoken npm run web')
+    } else {
+      fatal('加载失败', e.message ?? '未知错误', '请确认服务仍在运行，并查看终端输出。')
+    }
+    toast(e.message, true)
+  })
 }
